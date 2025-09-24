@@ -1,0 +1,150 @@
+version: '3.8'
+
+services:
+  # Database
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: meeting_assistant
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Ingestion Service
+  ingestion:
+    build: ./services/ingestion
+    ports:
+      - "8001:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/ingestion:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ASR Service
+  asr:
+    build: ./services/asr
+    ports:
+      - "8002:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/asr:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # NLU Service
+  nlu:
+    build: ./services/nlu
+    ports:
+      - "8003:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/nlu:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # RAG Service
+  rag:
+    build: ./services/rag
+    ports:
+      - "8004:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/rag:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Agent Service
+  agent:
+    build: ./services/agent
+    ports:
+      - "8005:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/agent:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Integrations Service
+  integrations:
+    build: ./services/integrations
+    ports:
+      - "8006:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./services/integrations:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # UI Service
+  ui:
+    build: ./services/ui
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8001
+    volumes:
+      - ./services/ui:/app
+      - /app/node_modules
+    command: npm run dev
+
+volumes:
+  postgres_data:
+  redis_data:
