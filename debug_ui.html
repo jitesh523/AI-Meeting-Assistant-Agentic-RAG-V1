@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Meeting Assistant - Debug UI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; background: #1a1a1a; color: white; }
+        .debug-section { background: #2a2a2a; padding: 20px; margin: 10px 0; border-radius: 8px; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 4px; }
+        .success { background: #2d5a2d; }
+        .error { background: #5a2d2d; }
+        .info { background: #2d4a5a; }
+        button { background: #6366f1; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin: 5px; }
+        button:hover { background: #4f46e5; }
+        button:disabled { background: #666; cursor: not-allowed; }
+        #log { background: #000; color: #0f0; padding: 10px; border-radius: 4px; font-family: monospace; height: 300px; overflow-y: auto; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h1>🔧 AI Meeting Assistant - Debug UI</h1>
+    
+    <div class="debug-section">
+        <h2>Connection Status</h2>
+        <div id="connection-status" class="status info">Not connected</div>
+        <button onclick="testConnection()">Test Connection</button>
+        <button onclick="connectWebSocket()">Connect WebSocket</button>
+    </div>
+    
+    <div class="debug-section">
+        <h2>Chat Test</h2>
+        <div class="flex gap-2">
+            <input type="text" id="test-message" placeholder="Type a test message..." style="flex: 1; padding: 10px; background: #333; color: white; border: 1px solid #555; border-radius: 4px;">
+            <button onclick="sendTestMessage()">Send Message</button>
+        </div>
+        <div id="chat-status" class="status info">Ready to test</div>
+    </div>
+    
+    <div class="debug-section">
+        <h2>File Upload Test</h2>
+        <input type="file" id="test-file" multiple accept=".pdf,.doc,.docx,.txt,.md">
+        <button onclick="testFileUpload()">Test Upload</button>
+        <div id="upload-status" class="status info">Select a file to test</div>
+    </div>
+    
+    <div class="debug-section">
+        <h2>API Test</h2>
+        <button onclick="testStartMeeting()">Start Meeting</button>
+        <button onclick="testHealth()">Health Check</button>
+        <div id="api-status" class="status info">Ready to test APIs</div>
+    </div>
+    
+    <div class="debug-section">
+        <h2>Debug Log</h2>
+        <div id="log"></div>
+        <button onclick="clearLog()">Clear Log</button>
+    </div>
+
+    <script>
+        let ws = null;
+        let meetingId = 'debug_meeting_' + Date.now();
+        
+        function log(message) {
+            const logDiv = document.getElementById('log');
+            const timestamp = new Date().toLocaleTimeString();
+            logDiv.textContent += `[${timestamp}] ${message}\n`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+        
+        function clearLog() {
+            document.getElementById('log').textContent = '';
+        }
+        
+        async function testConnection() {
+            log('Testing server connection...');
+            try {
+                const response = await fetch('http://localhost:8002/health');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    document.getElementById('connection-status').className = 'status success';
+                    document.getElementById('connection-status').textContent = `✅ Connected - Groq: ${data.groq_available}`;
+                    log('✅ Server connection successful');
+                } else {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+            } catch (error) {
+                document.getElementById('connection-status').className = 'status error';
+                document.getElementById('connection-status').textContent = `❌ Connection failed: ${error.message}`;
+                log(`❌ Connection failed: ${error.message}`);
+            }
+        }
+        
+        function connectWebSocket() {
+            log('Connecting to WebSocket...');
+            try {
+                ws = new WebSocket(`ws://localhost:8002/ws/audio/${meetingId}`);
+                
+                ws.onopen = function() {
+                    document.getElementById('connection-status').className = 'status success';
+                    document.getElementById('connection-status').textContent = '✅ WebSocket connected';
+                    log('✅ WebSocket connected successfully');
+                };
+                
+                ws.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+                    log(`📨 Received: ${data.type} - ${JSON.stringify(data).substring(0, 100)}...`);
+                };
+                
+                ws.onclose = function() {
+                    document.getElementById('connection-status').className = 'status error';
+                    document.getElementById('connection-status').textContent = '❌ WebSocket disconnected';
+                    log('❌ WebSocket disconnected');
+                };
+                
+                ws.onerror = function(error) {
+                    document.getElementById('connection-status').className = 'status error';
+                    document.getElementById('connection-status').textContent = '❌ WebSocket error';
+                    log(`❌ WebSocket error: ${error}`);
+                };
+                
+            } catch (error) {
+                log(`❌ WebSocket connection failed: ${error.message}`);
+            }
+        }
+        
+        function sendTestMessage() {
+            const input = document.getElementById('test-message');
+            const message = input.value.trim();
+            
+            if (!message) {
+                log('❌ No message to send');
+                return;
+            }
+            
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                log('❌ WebSocket not connected');
+                document.getElementById('chat-status').className = 'status error';
+                document.getElementById('chat-status').textContent = '❌ WebSocket not connected';
+                return;
+            }
+            
+            try {
+                const messageData = {
+                    type: "chat",
+                    text: message
+                };
+                
+                ws.send(JSON.stringify(messageData));
+                log(`📤 Sent message: ${message}`);
+                
+                document.getElementById('chat-status').className = 'status success';
+                document.getElementById('chat-status').textContent = '✅ Message sent';
+                
+                input.value = '';
+            } catch (error) {
+                log(`❌ Error sending message: ${error.message}`);
+                document.getElementById('chat-status').className = 'status error';
+                document.getElementById('chat-status').textContent = `❌ Send failed: ${error.message}`;
+            }
+        }
+        
+        async function testFileUpload() {
+            const fileInput = document.getElementById('test-file');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                log('❌ No file selected');
+                return;
+            }
+            
+            log(`Testing file upload: ${file.name} (${file.size} bytes)`);
+            
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+                formData.append('meeting_id', meetingId);
+                
+                const response = await fetch('http://localhost:8002/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (response.ok) {
+                    log(`✅ File upload successful: ${result.file_id}`);
+                    document.getElementById('upload-status').className = 'status success';
+                    document.getElementById('upload-status').textContent = `✅ Uploaded: ${file.name}`;
+                } else {
+                    throw new Error(result.message || `HTTP ${response.status}`);
+                }
+            } catch (error) {
+                log(`❌ File upload failed: ${error.message}`);
+                document.getElementById('upload-status').className = 'status error';
+                document.getElementById('upload-status').textContent = `❌ Upload failed: ${error.message}`;
+            }
+        }
+        
+        async function testStartMeeting() {
+            log('Testing start meeting API...');
+            try {
+                const response = await fetch('http://localhost:8002/meetings/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        meeting_id: meetingId,
+                        title: 'Debug Test Meeting',
+                        platform: 'Debug UI',
+                        start_time: Date.now() / 1000,
+                        privacy_mode: 'private',
+                        participants: ['Debug User']
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (response.ok) {
+                    log(`✅ Meeting started: ${result.meeting_id}`);
+                    document.getElementById('api-status').className = 'status success';
+                    document.getElementById('api-status').textContent = '✅ Meeting started successfully';
+                } else {
+                    throw new Error(result.message || `HTTP ${response.status}`);
+                }
+            } catch (error) {
+                log(`❌ Start meeting failed: ${error.message}`);
+                document.getElementById('api-status').className = 'status error';
+                document.getElementById('api-status').textContent = `❌ Start meeting failed: ${error.message}`;
+            }
+        }
+        
+        async function testHealth() {
+            log('Testing health API...');
+            try {
+                const response = await fetch('http://localhost:8002/health');
+                const data = await response.json();
+                
+                log(`✅ Health check: ${JSON.stringify(data)}`);
+                document.getElementById('api-status').className = 'status success';
+                document.getElementById('api-status').textContent = '✅ Health check passed';
+            } catch (error) {
+                log(`❌ Health check failed: ${error.message}`);
+                document.getElementById('api-status').className = 'status error';
+                document.getElementById('api-status').textContent = `❌ Health check failed: ${error.message}`;
+            }
+        }
+        
+        // Auto-run tests on page load
+        window.onload = function() {
+            log('🔧 Debug UI loaded - running initial tests...');
+            testConnection();
+            testHealth();
+        };
+        
+        // Initialize Lucide icons
+        lucide.createIcons();
+    </script>
+</body>
+</html>

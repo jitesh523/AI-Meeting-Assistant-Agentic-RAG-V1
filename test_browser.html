@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Meeting Assistant - Browser Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a1a;
+            color: white;
+        }
+        .test-section {
+            background: #2a2a2a;
+            padding: 20px;
+            margin: 10px 0;
+            border-radius: 8px;
+            border: 1px solid #444;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .success { background: #2d5a2d; }
+        .error { background: #5a2d2d; }
+        .info { background: #2d4a5a; }
+        button {
+            background: #6366f1;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:hover { background: #4f46e5; }
+        button:disabled { background: #666; cursor: not-allowed; }
+        #log {
+            background: #000;
+            color: #0f0;
+            padding: 10px;
+            border-radius: 4px;
+            font-family: monospace;
+            height: 200px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+    <h1>🤖 AI Meeting Assistant - Browser Test</h1>
+    
+    <div class="test-section">
+        <h2>Server Status</h2>
+        <div id="server-status" class="status info">Testing...</div>
+        <button onclick="testServer()">Test Server Connection</button>
+    </div>
+    
+    <div class="test-section">
+        <h2>WebSocket Test</h2>
+        <div id="ws-status" class="status info">Not connected</div>
+        <button onclick="testWebSocket()">Test WebSocket</button>
+        <button onclick="sendTestMessage()" id="send-btn" disabled>Send Test Message</button>
+    </div>
+    
+    <div class="test-section">
+        <h2>AI Test</h2>
+        <div id="ai-status" class="status info">Not tested</div>
+        <button onclick="testAI()">Test AI Response</button>
+    </div>
+    
+    <div class="test-section">
+        <h2>Test Log</h2>
+        <div id="log"></div>
+        <button onclick="clearLog()">Clear Log</button>
+    </div>
+
+    <script>
+        let ws = null;
+        
+        function log(message) {
+            const logDiv = document.getElementById('log');
+            const timestamp = new Date().toLocaleTimeString();
+            logDiv.textContent += `[${timestamp}] ${message}\n`;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+        
+        function clearLog() {
+            document.getElementById('log').textContent = '';
+        }
+        
+        async function testServer() {
+            const statusDiv = document.getElementById('server-status');
+            try {
+                log('Testing server connection...');
+                const response = await fetch('http://localhost:8002/health');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    statusDiv.className = 'status success';
+                    statusDiv.textContent = `✅ Server healthy - Groq: ${data.groq_available ? 'Available' : 'Not available'}`;
+                    log('✅ Server connection successful');
+                } else {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+            } catch (error) {
+                statusDiv.className = 'status error';
+                statusDiv.textContent = `❌ Server error: ${error.message}`;
+                log(`❌ Server connection failed: ${error.message}`);
+            }
+        }
+        
+        function testWebSocket() {
+            const statusDiv = document.getElementById('ws-status');
+            const sendBtn = document.getElementById('send-btn');
+            
+            try {
+                log('Connecting to WebSocket...');
+                ws = new WebSocket('ws://localhost:8002/ws/audio/test_meeting_browser');
+                
+                ws.onopen = function() {
+                    statusDiv.className = 'status success';
+                    statusDiv.textContent = '✅ WebSocket connected';
+                    sendBtn.disabled = false;
+                    log('✅ WebSocket connected successfully');
+                };
+                
+                ws.onmessage = function(event) {
+                    const data = JSON.parse(event.data);
+                    log(`📨 Received: ${data.type} - ${JSON.stringify(data).substring(0, 100)}...`);
+                };
+                
+                ws.onclose = function() {
+                    statusDiv.className = 'status error';
+                    statusDiv.textContent = '❌ WebSocket disconnected';
+                    sendBtn.disabled = true;
+                    log('❌ WebSocket disconnected');
+                };
+                
+                ws.onerror = function(error) {
+                    statusDiv.className = 'status error';
+                    statusDiv.textContent = '❌ WebSocket error';
+                    log(`❌ WebSocket error: ${error}`);
+                };
+                
+            } catch (error) {
+                statusDiv.className = 'status error';
+                statusDiv.textContent = `❌ WebSocket error: ${error.message}`;
+                log(`❌ WebSocket connection failed: ${error.message}`);
+            }
+        }
+        
+        function sendTestMessage() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const message = {
+                    type: "chat",
+                    text: "This is a test message from the browser. Can you help me with Q4 planning?"
+                };
+                ws.send(JSON.stringify(message));
+                log('📤 Sent test message');
+            } else {
+                log('❌ WebSocket not connected');
+            }
+        }
+        
+        async function testAI() {
+            const statusDiv = document.getElementById('ai-status');
+            try {
+                log('Testing AI directly...');
+                const response = await fetch('http://localhost:8002/meetings/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        meeting_id: 'ai_test_meeting',
+                        title: 'AI Test Meeting',
+                        platform: 'Browser Test',
+                        start_time: Date.now() / 1000,
+                        privacy_mode: 'private',
+                        participants: ['Test User']
+                    })
+                });
+                
+                if (response.ok) {
+                    statusDiv.className = 'status success';
+                    statusDiv.textContent = '✅ AI test meeting started';
+                    log('✅ AI test meeting started successfully');
+                } else {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+            } catch (error) {
+                statusDiv.className = 'status error';
+                statusDiv.textContent = `❌ AI test failed: ${error.message}`;
+                log(`❌ AI test failed: ${error.message}`);
+            }
+        }
+        
+        // Auto-run server test on page load
+        window.onload = function() {
+            testServer();
+        };
+    </script>
+</body>
+</html>
