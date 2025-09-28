@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Dict, List, Optional, Any
 from fastapi import FastAPI, BackgroundTasks
+from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as redis
 import asyncpg
@@ -74,6 +75,11 @@ class RAGResult(BaseModel):
     confidence: float
     documents: List[Dict[str, Any]]
 
+class TextInput(BaseModel):
+    speaker: str = "User"
+    text: str
+    timestamp: float = 0.0
+
 # Available tools
 AVAILABLE_TOOLS = {
     "search_docs": {
@@ -137,7 +143,7 @@ async def process_agent_stream():
             # Subscribe to agent processing channels
             pubsub = redis_client.pubsub()
             await pubsub.subscribe("agent_process", "agent_rag_result")
-            
+
             async for message in pubsub.listen():
                 if message["type"] == "message":
                     if message["channel"] == "agent_process":
@@ -146,10 +152,122 @@ async def process_agent_stream():
                     elif message["channel"] == "agent_rag_result":
                         data = json.loads(message["data"])
                         await process_rag_result(RAGResult(**data))
-                    
+
         except Exception as e:
             logger.error(f"Error processing agent stream: {e}")
             await asyncio.sleep(1)
+
+# --- New: Generate suggestions directly from raw text (no audio path) ---
+@app.post("/agent/meetings/{meeting_id}/suggest-from-text")
+async def suggest_from_text(meeting_id: str, inp: TextInput = Body(...)):
+    try:
+        nlu = NLUResult(
+            meeting_id=meeting_id,
+            speaker=inp.speaker,
+            text=inp.text,
+            timestamp=inp.timestamp,
+            intent="question" if inp.text.strip().endswith("?") else "statement",
+            entities=[],
+            sentiment="neutral",
+            confidence=0.8,
+            topics=[],
+            is_decision=False,
+            is_question=inp.text.strip().endswith("?"),
+        )
+        suggestions = await analyze_and_suggest(nlu)
+        for s in suggestions:
+            await store_suggestion(s)
+        await send_to_ui(suggestions, meeting_id)
+        return {"status": "success", "generated": [s.dict() for s in suggestions]}
+    except Exception as e:
+        logger.error(f"Error in suggest_from_text: {e}")
+        return {"status": "error", "message": str(e)}
+
+# --- New: Summarize meeting and fetch summary ---
+@app.post("/agent/meetings/{meeting_id}/summarize")
+async def summarize_meeting(meeting_id: str):
+    try:
+        # Fetch last N utterances
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT speaker, text, start_ms
+                FROM utterances
+                WHERE meeting_id = $1
+                ORDER BY id DESC
+                LIMIT 50
+                """,
+                meeting_id,
+            )
+        transcript = "\n".join([f"{r['speaker']}: {r['text']}" for r in reversed(rows)])
+
+        summary_text = None
+        try:
+            # Use OpenAI if configured with a real key
+            if openai_client and getattr(openai_client, "api_key", "your-api-key-here") != "your-api-key-here":
+                resp = openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "Summarize the meeting into Objectives, Key Points, Decisions, and Action Items (with owners). Be concise."},
+                        {"role": "user", "content": transcript or "No transcript"},
+                    ],
+                    max_tokens=300,
+                    temperature=0.3,
+                )
+                summary_text = resp.choices[0].message.content.strip()
+        except Exception as e:
+            logger.warning(f"OpenAI summarization failed, using heuristic: {e}")
+            summary_text = None
+
+        if not summary_text:
+            # Heuristic fallback
+            bullets = []
+            bullets.append("Objectives: Discuss goals and next steps.")
+            if transcript:
+                lines = [l for l in transcript.splitlines() if l.strip()]
+                bullets.append(f"Key Points: {min(len(lines),5)} key exchanges.")
+            bullets.append("Decisions: None recorded.")
+            bullets.append("Action Items: Capture tasks in follow-up.")
+            summary_text = "\n".join([f"- {b}" for b in bullets])
+
+        # Store in meeting_analytics
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO meeting_analytics (id, meeting_id, metric_name, metric_value, calculated_at)
+                VALUES (gen_random_uuid(), $1, 'summary', $2::jsonb, now())
+                """,
+                meeting_id,
+                json.dumps({"text": summary_text}),
+            )
+
+        return {"status": "success", "summary": summary_text}
+    except Exception as e:
+        logger.error(f"Error in summarize_meeting: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/agent/meetings/{meeting_id}/summary")
+async def get_summary(meeting_id: str):
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT metric_value, calculated_at
+                FROM meeting_analytics
+                WHERE meeting_id = $1 AND metric_name = 'summary'
+                ORDER BY calculated_at DESC
+                LIMIT 1
+                """,
+                meeting_id,
+            )
+        if not row:
+            return {"summary": None}
+        val = row["metric_value"]
+        text = val.get("text") if isinstance(val, dict) else json.loads(val).get("text")
+        return {"summary": text, "timestamp": row["calculated_at"].isoformat()}
+    except Exception as e:
+        logger.error(f"Error in get_summary: {e}")
+        return {"status": "error", "message": str(e)}
 
 async def process_nlu_result(nlu_result: NLUResult):
     """Process NLU result and generate suggestions"""

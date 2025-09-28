@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as redis
 import asyncpg
@@ -44,6 +45,11 @@ class MeetingMetadata(BaseModel):
     start_time: float
     privacy_mode: str
     participants: list[str]
+
+class TextUtterance(BaseModel):
+    speaker: str = "User"
+    text: str
+    timestamp: float = 0.0
 
 @app.on_event("startup")
 async def startup():
@@ -197,6 +203,55 @@ async def end_meeting(meeting_id: str):
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "service": "ingestion"}
+
+# --- New: Accept text utterances without audio ---
+@app.post("/meetings/{meeting_id}/utterances")
+async def post_utterance(meeting_id: str, utterance: TextUtterance = Body(...)):
+    """Accept a text utterance (fallback when no audio UI yet).
+    - Stores in DB (utterances)
+    - Publishes a minimal NLU-like event to agent via Redis ('agent_process')
+    """
+    try:
+        # Store utterance in DB
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO utterances (meeting_id, speaker, start_ms, end_ms, text, conf)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                meeting_id, utterance.speaker, int(utterance.timestamp * 1000), int(utterance.timestamp * 1000) + 1000,
+                utterance.text, 0.99,
+            )
+
+        # Very simple intent heuristics
+        text_l = utterance.text.lower()
+        intent = "question" if text_l.strip().endswith("?") else (
+            "action_item" if any(k in text_l for k in ["todo", "action", "task", "assign"]) else "statement"
+        )
+        is_decision = any(k in text_l for k in ["decide", "approved", "agreed", "decision"])  # naive
+        is_question = intent == "question"
+
+        nlu_event = {
+            "meeting_id": meeting_id,
+            "speaker": utterance.speaker,
+            "text": utterance.text,
+            "timestamp": utterance.timestamp,
+            "intent": intent,
+            "entities": [],
+            "sentiment": "neutral",
+            "confidence": 0.8,
+            "topics": [],
+            "is_decision": is_decision,
+            "is_question": is_question,
+        }
+
+        # Publish to agent channel consumed by Agent service
+        await redis_client.publish("agent_process", json.dumps(nlu_event))
+
+        return {"status": "success", "published": True}
+    except Exception as e:
+        logger.error(f"Error posting utterance: {e}")
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
