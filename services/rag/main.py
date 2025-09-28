@@ -4,8 +4,8 @@ RAG Service - Retrieval-Augmented Generation for context-aware responses
 import asyncio
 import json
 import logging
-from typing import Dict, List, Optional, Tuple
-from fastapi import FastAPI, BackgroundTasks
+from typing import Dict, List, Optional, Tuple, Any
+from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as redis
 import asyncpg
@@ -41,7 +41,7 @@ class Document(BaseModel):
     tenant_id: str
     source: str
     text: str
-    metadata: Dict[str, any]
+    metadata: Dict[str, Any]
     embedding: List[float]
 
 class QueryResult(BaseModel):
@@ -250,6 +250,81 @@ async def query_rag(rag_query: RAGQuery, background_tasks: BackgroundTasks):
     """Query RAG system directly"""
     background_tasks.add_task(process_rag_query, rag_query)
     return {"status": "processing"}
+
+@app.get("/rag/search")
+async def search_rag(q: str, tenant_id: str, k: int = 5):
+    """Simple search endpoint returning top-k documents for a query"""
+    try:
+        query_embedding = generate_embedding(q)
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT doc_id, tenant_id, source, text, metadata, embedding
+                FROM documents
+                WHERE tenant_id = $1
+                ORDER BY embedding <-> $2
+                LIMIT $3
+                """,
+                tenant_id, query_embedding, k,
+            )
+
+        hits = []
+        for row in rows:
+            hits.append({
+                "doc_id": str(row["doc_id"]),
+                "tenant_id": str(row["tenant_id"]),
+                "source": row["source"],
+                "text": row["text"],
+                "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+            })
+        return {"query": q, "tenant_id": tenant_id, "k": k, "hits": hits}
+    except Exception as e:
+        logger.error(f"Error in /rag/search: {e}")
+        return {"error": str(e)}
+
+@app.post("/rag/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    tenant_id: str = Form(...),
+    source: str = Form("upload")
+):
+    """Upload a small text file and index it. For PDFs, add parsing later."""
+    try:
+        content_bytes = await file.read()
+        # Basic size guard (e.g., 1 MB)
+        if len(content_bytes) > 1_000_000:
+            return {"status": "error", "message": "File too large (max 1MB)"}
+
+        # Assume UTF-8 text for MVP
+        text = content_bytes.decode("utf-8", errors="ignore")
+        if not text.strip():
+            return {"status": "error", "message": "Empty or invalid text content"}
+
+        # Generate embedding and store
+        embedding = generate_embedding(text)
+        doc_id = str(asyncpg.uuid.uuid4()) if hasattr(asyncpg, "uuid") else None
+
+        async with db_pool.acquire() as conn:
+            # Generate doc_id in SQL if not generated in Python
+            if not doc_id:
+                row = await conn.fetchrow("SELECT gen_random_uuid() AS id")
+                doc_id = str(row["id"])
+
+            await conn.execute(
+                """
+                INSERT INTO documents (doc_id, tenant_id, source, text, metadata, embedding)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (doc_id) DO UPDATE SET text = EXCLUDED.text,
+                                                metadata = EXCLUDED.metadata,
+                                                embedding = EXCLUDED.embedding
+                """,
+                doc_id, tenant_id, source, text, json.dumps({"filename": file.filename}), embedding,
+            )
+
+        return {"status": "success", "doc_id": doc_id}
+    except Exception as e:
+        logger.error(f"Error in /rag/upload: {e}")
+        return {"status": "error", "message": str(e)}
 
 @app.post("/rag/documents")
 async def add_document(document: Document):

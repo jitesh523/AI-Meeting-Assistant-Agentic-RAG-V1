@@ -176,7 +176,8 @@ INSERT INTO suggestions (meeting_id, kind, text, payload, confidence, reasons, c
 ('550e8400-e29b-41d4-a716-446655440000', 'ask', 'Would you like me to search for project information?', '{"query": "project information", "topics": ["project"]}', 0.85, '["Project mentioned", "Context available"]', '[]', 'pending');
 
 -- Insert sample documents for RAG
-INSERT INTO documents (tenant_id, source, text, metadata, embedding) VALUES
-('tenant-123', 'gmail', 'Project Alpha is our main initiative for Q4. We need to complete the MVP by December 15th.', '{"subject": "Project Alpha Update", "date": "2024-01-15"}', '[0.1, 0.2, 0.3]'::vector),
-('tenant-123', 'notion', 'The project timeline includes three phases: planning, development, and testing.', '{"page": "Project Timeline", "updated": "2024-01-10"}', '[0.4, 0.5, 0.6]'::vector),
-('tenant-123', 'slack', 'Team standup: We are on track for the sprint goals. No blockers identified.', '{"channel": "general", "timestamp": "2024-01-16T10:00:00Z"}', '[0.7, 0.8, 0.9]'::vector);
+WITH t AS (SELECT gen_random_uuid() AS tenant_id)
+INSERT INTO documents (tenant_id, source, text, metadata) VALUES
+((SELECT tenant_id FROM t), 'gmail', 'Project Alpha is our main initiative for Q4. We need to complete the MVP by December 15th.', '{"subject": "Project Alpha Update", "date": "2024-01-15"}'),
+((SELECT tenant_id FROM t), 'notion', 'The project timeline includes three phases: planning, development, and testing.', '{"page": "Project Timeline", "updated": "2024-01-10"}'),
+((SELECT tenant_id FROM t), 'slack', 'Team standup: We are on track for the sprint goals. No blockers identified.', '{"channel": "general", "timestamp": "2024-01-16T10:00:00Z"}');

@@ -98,15 +98,15 @@ def initialize_groq():
         if not api_key or api_key == "your-api-key-here":
             logger.warning("No valid Groq API key found. Using mock responses.")
             return False
-            
+
         groq_client = Groq(api_key=api_key)
-        
+
         # Try different model names
         model_names = ['llama-3.1-8b-instant', 'llama-3.1-70b-versatile', 'mixtral-8x7b-32768']
         for model_name in model_names:
             try:
                 # Test the model with a simple request
-                test_response = groq_client.chat.completions.create(
+                groq_client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "user", "content": "Hello"}],
                     max_tokens=10
@@ -117,11 +117,10 @@ def initialize_groq():
             except Exception as model_error:
                 logger.warning(f"Failed to initialize model '{model_name}': {model_error}")
                 continue
-                
+
         logger.warning("All Groq models failed to initialize. Using mock responses.")
         return False
-        
-except Exception as e:
+    except Exception as e:
         logger.warning(f"Failed to initialize Groq: {e}. Using mock responses.")
         return False
 
@@ -194,12 +193,12 @@ Respond with a concise suggestion (max 150 words) that would be helpful for this
                 
                 # Parse Groq response
                 ai_text = response.choices[0].message.content.strip()
-            suggestion_data = {
-                "kind": "ask",
+                suggestion_data = {
+                    "kind": "ask",
                     "text": ai_text[:200] + "..." if len(ai_text) > 200 else ai_text,
-                "confidence": 0.85,
-                "reasons": ["AI analysis", "Contextual understanding"]
-            }
+                    "confidence": 0.85,
+                    "reasons": ["AI analysis", "Contextual understanding"]
+                }
                 logger.info("Successfully generated Groq AI suggestion")
             except Exception as groq_error:
                 logger.warning(f"Groq API error during processing: {groq_error}")
@@ -1631,8 +1630,9 @@ async def get_demo():
     return HTMLResponse(content=html_content)
 
 if __name__ == "__main__":
-    print("🚀 Starting AI Meeting Assistant with Co-pilot Nexus UI...")
-    print("📱 Open your browser to: http://localhost:8002")
-    print("🔧 Press Ctrl+C to stop the server")
+    print("Starting AI Meeting Assistant with Co-pilot Nexus UI...")
+    port = int(os.getenv("PORT", "8002"))
+    print(f"Open your browser to: http://localhost:{port}")
+    print("Press Ctrl+C to stop the server")
     
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+    uvicorn.run(app, host="0.0.0.0", port=port)
