@@ -25,7 +25,7 @@ const nextConfig = {
       },
       {
         source: '/api/agent/:path*',
-        destination: 'http://agent:8000/:path*',
+        destination: 'http://agent:8000/agent/:path*',
       },
       {
         source: '/api/integrations/:path*',
