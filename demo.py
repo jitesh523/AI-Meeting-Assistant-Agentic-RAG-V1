@@ -16,8 +16,6 @@ from typing import List, Dict, Any, Optional
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from groq import Groq
 
@@ -555,6 +553,7 @@ async def health_check():
 # Serve the demo HTML with Co-pilot Nexus UI
 @app.get("/")
 async def get_demo():
+    return {"message": "API running. Use Next.js UI at http://localhost:3000"}
     html_content = """
     <!DOCTYPE html>
     <html lang="en">
