@@ -23,7 +23,7 @@ interface Utterance {
 
 export default function Home() {
   const [isListening, setIsListening] = useState(false)
-  const [meetingId, setMeetingId] = useState<string>(`meeting_${Date.now()}`)
+  const [meetingId, setMeetingId] = useState<string>('')
   const [tenantId] = useState<string>('tenant_demo')
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [transcript, setTranscript] = useState<Utterance[]>([])
@@ -33,6 +33,8 @@ export default function Home() {
   const pollingRef = useRef<NodeJS.Timeout | null>(null)
 
   useEffect(() => {
+    // Generate a meeting ID on client to avoid SSR hydration mismatch
+    setMeetingId(`meeting_${Date.now()}`)
     // start suggestions polling when meeting active
     if (isListening && meetingId) {
       if (pollingRef.current) clearInterval(pollingRef.current)
