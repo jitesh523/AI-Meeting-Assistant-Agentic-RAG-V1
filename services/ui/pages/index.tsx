@@ -113,6 +113,18 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ speaker: 'You', text: utter.text, timestamp: Date.now() / 1000 }),
       })
+      // also directly request suggestions from agent for snappy UX
+      const res = await fetch(`/api/agent/meetings/${meetingId}/suggest-from-text`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ speaker: 'You', text: utter.text, timestamp: Date.now() / 1000 }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        if (data.generated && Array.isArray(data.generated)) {
+          setSuggestions(prev => [...prev, ...data.generated])
+        }
+      }
     } catch (e) {
       console.error('Failed to send utterance', e)
     }
