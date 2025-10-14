@@ -81,6 +81,7 @@ meetings = {}
 transcripts = {}
 suggestions = {}
 uploaded_files = {}
+summaries = {}
 
 # Create uploads directory
 UPLOAD_DIR = "uploads"
@@ -369,12 +370,74 @@ async def get_transcript(meeting_id: str):
         "transcript": [u.model_dump() for u in transcripts.get(meeting_id, [])]
     }
 
+# Simple search across transcript and uploaded file metadata/analysis
+@app.get("/search")
+async def search(query: str, meeting_id: Optional[str] = None, k: int = 10):
+    q = (query or "").lower()
+    hits = []
+    # Search transcript
+    if meeting_id and meeting_id in transcripts:
+        for u in transcripts[meeting_id]:
+            if q in u.text.lower():
+                hits.append({
+                    "source": "transcript",
+                    "speaker": u.speaker,
+                    "text": u.text,
+                    "timestamp": u.timestamp
+                })
+    # Search uploaded files (filename and analysis summary)
+    for f in uploaded_files.values():
+        text_blob = f"{f.filename} { (f.analysis or {}).get('summary','') }"
+        if q in text_blob.lower():
+            hits.append({
+                "source": "document",
+                "file_id": f.id,
+                "filename": f.filename,
+                "snippet": (f.analysis or {}).get('summary', '')[:280]
+            })
+    return {"query": query, "count": len(hits), "hits": hits[:k]}
+
 @app.get("/meetings/{meeting_id}/suggestions")
 async def get_suggestions(meeting_id: str):
     return {
         "meeting_id": meeting_id,
         "suggestions": [s.model_dump() for s in suggestions.get(meeting_id, [])]
     }
+
+# Generate and cache a simple meeting summary
+@app.post("/meetings/{meeting_id}/summarize")
+async def summarize_meeting(meeting_id: str):
+    uts = transcripts.get(meeting_id, [])
+    last_texts = [u.text for u in uts[-10:]]
+    files = [f.filename for f in uploaded_files.values()]
+    summary = {
+        "summary": (
+            "This meeting discussed: " + ("; ".join(last_texts[:3]) or "general topics") + 
+            (". Referenced files: " + ", ".join(files) if files else ".")
+        ),
+        "key_points": last_texts[:5],
+        "action_items": [
+            "Review notes and finalize next steps",
+            "Follow up with stakeholders",
+        ],
+    }
+    summaries[meeting_id] = summary
+    # Also broadcast as a suggestion card
+    await manager.send_to_meeting(meeting_id, {
+        "type": "suggestion",
+        "suggestion": Suggestion(
+            id=f"summary_{int(time.time())}",
+            kind="summary",
+            text=summary["summary"],
+            confidence=0.9,
+            reasons=["Auto-generated from transcript"],
+        ).model_dump()
+    })
+    return {"status": "ok", **summary}
+
+@app.get("/meetings/{meeting_id}/summary")
+async def get_summary(meeting_id: str):
+    return summaries.get(meeting_id, {"summary": "No summary yet", "key_points": [], "action_items": []})
 
 @app.post("/suggestions/{suggestion_id}/approve")
 async def approve_suggestion(suggestion_id: str):
@@ -1494,11 +1557,43 @@ async def get_demo():
 
             function performSearch() {
                 const query = document.getElementById('searchInput').value.trim();
-                if (query) {
-                    console.log('Searching for:', query);
-                    // TODO: Implement search functionality
-                    alert('Search functionality will be implemented in the next iteration!');
+                if (!query) return;
+                const containerParent = document.getElementById('searchBtn').parentElement.parentElement;
+                let results = document.getElementById('searchResults');
+                if (!results) {
+                    results = document.createElement('div');
+                    results.id = 'searchResults';
+                    results.className = 'mt-4 space-y-2';
+                    containerParent.appendChild(results);
                 }
+                results.innerHTML = '<div class="text-sm text-gray-400">Searching…</div>';
+
+                fetch(`/search?query=${encodeURIComponent(query)}&meeting_id=${encodeURIComponent(meetingId)}&k=20`)
+                    .then(r => r.json())
+                    .then(data => {
+                        if (!data.hits || data.hits.length === 0) {
+                            results.innerHTML = '<div class="text-sm text-gray-400">No results.</div>';
+                            return;
+                        }
+                        const items = data.hits.map(h => {
+                            if (h.source === 'transcript') {
+                                return `<div class="p-3 rounded bg-gray-800/60 border border-gray-700">
+                                    <div class="text-xs text-gray-500 mb-1">Transcript • ${new Date(h.timestamp).toLocaleTimeString()}</div>
+                                    <div class="text-sm text-gray-200"><strong>${h.speaker}:</strong> ${h.text}</div>
+                                </div>`;
+                            } else {
+                                return `<div class="p-3 rounded bg-gray-800/60 border border-gray-700">
+                                    <div class="text-xs text-gray-500 mb-1">Document • ${h.filename || ''}</div>
+                                    <div class="text-sm text-gray-200">${h.snippet || ''}</div>
+                                </div>`;
+                            }
+                        }).join('');
+                        results.innerHTML = `<div class="text-sm text-gray-400 mb-2">${data.count} results</div>${items}`;
+                    })
+                    .catch(e => {
+                        console.error('Search error', e);
+                        results.innerHTML = '<div class="text-sm text-red-400">Search failed.</div>';
+                    });
             }
 
             // Drag and drop functionality
@@ -1589,39 +1684,39 @@ async def get_demo():
                 URL.revokeObjectURL(url);
             }
 
-            // Generate meeting summary
+            // Generate meeting summary (calls backend)
             function generateSummary() {
                 const summarySection = document.getElementById('summarySection');
                 const summaryContent = document.getElementById('meetingSummary');
-                
-                // Simulate AI summary generation
-                summaryContent.innerHTML = `
-                    <div class="space-y-4">
-                        <div class="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4">
-                            <h4 class="font-semibold text-blue-400 mb-2">Key Discussion Points</h4>
-                            <ul class="text-sm text-gray-300 space-y-1">
-                                <li>• Q4 strategic planning and timeline review</li>
-                                <li>• Resource allocation and budget considerations</li>
-                                <li>• Team coordination and communication protocols</li>
-                            </ul>
-                        </div>
-                        <div class="bg-green-500/10 border border-green-500/20 rounded-lg p-4">
-                            <h4 class="font-semibold text-green-400 mb-2">Action Items</h4>
-                            <ul class="text-sm text-gray-300 space-y-1">
-                                <li>• Sarah to finalize Q4 budget by next Friday</li>
-                                <li>• Marcus to schedule follow-up with stakeholders</li>
-                                <li>• Emily to prepare project timeline presentation</li>
-                            </ul>
-                        </div>
-                        <div class="bg-purple-500/10 border border-purple-500/20 rounded-lg p-4">
-                            <h4 class="font-semibold text-purple-400 mb-2">Next Steps</h4>
-                            <p class="text-sm text-gray-300">Schedule follow-up meeting in 2 weeks to review progress on action items and adjust timeline as needed.</p>
-                        </div>
-                    </div>
-                `;
-                
-                summarySection.style.display = 'block';
-                summarySection.scrollIntoView({ behavior: 'smooth' });
+                summaryContent.innerHTML = '<div class="text-sm text-gray-400">Generating summary…</div>';
+                fetch(`/meetings/${encodeURIComponent(meetingId)}/summarize`, { method: 'POST' })
+                    .then(r => r.json())
+                    .then(data => {
+                        const kp = (data.key_points || []).map(p => `<li>• ${p}</li>`).join('');
+                        const ai = (data.action_items || []).map(p => `<li>• ${p}</li>`).join('');
+                        summaryContent.innerHTML = `
+                            <div class="space-y-4">
+                                <div class="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4">
+                                    <h4 class="font-semibold text-blue-400 mb-2">Summary</h4>
+                                    <p class="text-sm text-gray-300">${data.summary || 'No summary'}</p>
+                                </div>
+                                ${kp ? `<div class=\"bg-green-500/10 border border-green-500/20 rounded-lg p-4\">
+                                    <h4 class=\"font-semibold text-green-400 mb-2\">Key Points</h4>
+                                    <ul class=\"text-sm text-gray-300 space-y-1\">${kp}</ul>
+                                </div>` : ''}
+                                ${ai ? `<div class=\"bg-purple-500/10 border border-purple-500/20 rounded-lg p-4\">
+                                    <h4 class=\"font-semibold text-purple-400 mb-2\">Action Items</h4>
+                                    <ul class=\"text-sm text-gray-300 space-y-1\">${ai}</ul>
+                                </div>` : ''}
+                            </div>`;
+                        summarySection.style.display = 'block';
+                        summarySection.scrollIntoView({ behavior: 'smooth' });
+                    })
+                    .catch(e => {
+                        console.error('Summarize error', e);
+                        summaryContent.innerHTML = '<div class="text-sm text-red-400">Failed to generate summary.</div>';
+                        summarySection.style.display = 'block';
+                    });
             }
         </script>
     </body>
