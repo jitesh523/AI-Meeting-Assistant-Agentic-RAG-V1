@@ -16,6 +16,7 @@ from typing import List, Dict, Any, Optional
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from groq import Groq
 
@@ -553,7 +554,7 @@ async def health_check():
 # Serve the demo HTML with Co-pilot Nexus UI
 @app.get("/")
 async def get_demo():
-    return {"message": "API running. Use Next.js UI at http://localhost:3000"}
+    # Serve embedded HTML UI
     html_content = """
     <!DOCTYPE html>
     <html lang="en">
@@ -1629,9 +1630,7 @@ async def get_demo():
     return HTMLResponse(content=html_content)
 
 if __name__ == "__main__":
-    print("Starting AI Meeting Assistant with Co-pilot Nexus UI...")
+    print("Starting AI Meeting Assistant with Co-pilot Nexus UI (API-only root)...")
     port = int(os.getenv("PORT", "8002"))
     print(f"Open your browser to: http://localhost:{port}")
-    print("Press Ctrl+C to stop the server")
-    
     uvicorn.run(app, host="0.0.0.0", port=port)
