@@ -19,6 +19,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from groq import Groq
+import tempfile
+import io
+try:
+    from faster_whisper import WhisperModel  # optional
+    FAST_WHISPER_AVAILABLE = True
+except Exception:
+    FAST_WHISPER_AVAILABLE = False
+try:
+    # Optional OpenAI whisper fallback
+    from openai import OpenAI as OpenAIClient  # type: ignore
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
+import sqlite3
 
 # Configure logging
 import logging
@@ -36,6 +50,36 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- Simple API key auth + naive rate limiting ---
+DEMO_API_KEY = os.getenv("DEMO_API_KEY")  # if set, require X-API-Key header
+RATE_LIMIT_RPM = int(os.getenv("DEMO_RATE_LIMIT_RPM", "120"))
+_rate_buckets: Dict[str, list] = {}
+
+@app.middleware("http")
+async def auth_and_rate_limit(request, call_next):
+    path = request.url.path
+    # Skip for health and UI root
+    if path in ("/", "/health"):
+        return await call_next(request)
+    # Auth
+    if DEMO_API_KEY:
+        if request.headers.get("X-API-Key") != DEMO_API_KEY:
+            return HTMLResponse(status_code=401, content="Unauthorized")
+    # Rate limit per IP
+    try:
+        ip = request.client.host if request.client else "unknown"
+        now = time.time()
+        window = 60.0
+        bucket = _rate_buckets.setdefault(ip, [])
+        # drop old
+        _rate_buckets[ip] = [t for t in bucket if now - t < window]
+        if len(_rate_buckets[ip]) >= RATE_LIMIT_RPM:
+            return HTMLResponse(status_code=429, content="Rate limit exceeded")
+        _rate_buckets[ip].append(now)
+    except Exception:
+        pass
+    return await call_next(request)
 
 # Data models
 class MeetingData(BaseModel):
@@ -83,6 +127,86 @@ suggestions = {}
 uploaded_files = {}
 summaries = {}
 
+# --- SQLite persistence (optional, best-effort) ---
+DB_PATH = os.getenv("DEMO_DB_PATH", "demo.db")
+
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meetings (
+                meeting_id TEXT PRIMARY KEY,
+                title TEXT,
+                platform TEXT,
+                start_time REAL,
+                privacy_mode TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transcripts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                meeting_id TEXT,
+                speaker TEXT,
+                text TEXT,
+                timestamp TEXT,
+                confidence REAL
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS files (
+                id TEXT PRIMARY KEY,
+                filename TEXT,
+                size INTEGER,
+                upload_time TEXT,
+                status TEXT,
+                content_type TEXT,
+                file_hash TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS summaries (
+                meeting_id TEXT PRIMARY KEY,
+                summary TEXT,
+                key_points TEXT,
+                action_items TEXT
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"DB init failed: {e}")
+
+def db_execute(query: str, params: tuple = ()):  # best-effort write
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(query, params)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.debug(f"DB write skipped: {e}")
+
+def db_query_all(query: str, params: tuple = ()):  # safe read helper
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.debug(f"DB read skipped: {e}")
+        return []
+
 # Create uploads directory
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -127,6 +251,8 @@ def initialize_groq():
 # Initialize Groq
 initialize_groq()
 active_connections = {}
+init_db()
+audio_buffers: Dict[str, bytearray] = {}
 
 # Simulated AI responses
 AI_RESPONSES = [
@@ -230,7 +356,7 @@ Respond with a concise suggestion (max 150 words) that would be helpful for this
             status="pending"
         )
         
-        # Store suggestion
+        # Store suggestion (in-memory)
         suggestions[meeting_id] = suggestions.get(meeting_id, [])
         suggestions[meeting_id].append(suggestion)
         
@@ -318,14 +444,17 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str):
                 # Try to receive binary data (for audio)
                 try:
                     audio_data = await asyncio.wait_for(websocket.receive_bytes(), timeout=5.0)
-                    # Simulate audio processing
+                    # Transcribe server-side if possible
+                    text = await transcribe_audio_bytes(audio_data)
+                    if not text:
+                        text = f"[Audio data received: {len(audio_data)} bytes]"
                     utterance = Utterance(
                         speaker="Speaker 1",
-                        text=f"[Audio data received: {len(audio_data)} bytes]",
+                        text=text,
                         timestamp=datetime.now().isoformat(),
-                        confidence=0.8
+                        confidence=0.9 if text and not text.startswith("[") else 0.8,
                     )
-                    logger.info(f"Processed audio data: {len(audio_data)} bytes")
+                    logger.info(f"Audio bytes: {len(audio_data)}; transcript: {text[:60]}...")
                 except Exception as e2:
                     logger.warning(f"Failed to receive binary data: {e2}")
                     # If both fail, break the loop to prevent infinite retries
@@ -335,6 +464,14 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str):
             if meeting_id not in transcripts:
                 transcripts[meeting_id] = []
             transcripts[meeting_id].append(utterance)
+            # persist transcript row
+            try:
+                db_execute(
+                    "INSERT INTO transcripts (meeting_id, speaker, text, timestamp, confidence) VALUES (?,?,?,?,?)",
+                    (meeting_id, utterance.speaker, utterance.text, utterance.timestamp, utterance.confidence)
+                )
+            except Exception as _:
+                pass
             
             # Send transcript to UI
             await manager.send_to_meeting(meeting_id, {
@@ -344,7 +481,6 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str):
             
             # Simulate AI processing
             await simulate_ai_processing(meeting_id, utterance)
-            
     except WebSocketDisconnect:
         manager.disconnect(meeting_id)
 
@@ -353,6 +489,17 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str):
 async def start_meeting(metadata: MeetingData):
     meetings[metadata.meeting_id] = metadata
     logger.info(f"Started meeting {metadata.meeting_id}")
+    # persist
+    db_execute(
+        "INSERT OR REPLACE INTO meetings (meeting_id, title, platform, start_time, privacy_mode) VALUES (?,?,?,?,?)",
+        (
+            metadata.meeting_id,
+            metadata.title,
+            metadata.platform,
+            metadata.start_time,
+            metadata.privacy_mode,
+        ),
+    )
     return {"status": "success", "meeting_id": metadata.meeting_id}
 
 @app.post("/meetings/{meeting_id}/end")
@@ -365,10 +512,20 @@ async def end_meeting(meeting_id: str):
 
 @app.get("/meetings/{meeting_id}/transcript")
 async def get_transcript(meeting_id: str):
-    return {
-        "meeting_id": meeting_id,
-        "transcript": [u.model_dump() for u in transcripts.get(meeting_id, [])]
-    }
+    items = [u.model_dump() for u in transcripts.get(meeting_id, [])]
+    # also include from DB if any
+    rows = db_query_all(
+        "SELECT speaker, text, timestamp, confidence FROM transcripts WHERE meeting_id=? ORDER BY id ASC",
+        (meeting_id,),
+    )
+    for speaker, text, ts, conf in rows:
+        items.append({
+            "speaker": speaker,
+            "text": text,
+            "timestamp": ts,
+            "confidence": conf,
+        })
+    return {"meeting_id": meeting_id, "transcript": items}
 
 # Simple search across transcript and uploaded file metadata/analysis
 @app.get("/search")
@@ -395,7 +552,34 @@ async def search(query: str, meeting_id: Optional[str] = None, k: int = 10):
                 "filename": f.filename,
                 "snippet": (f.analysis or {}).get('summary', '')[:280]
             })
-    return {"query": query, "count": len(hits), "hits": hits[:k]}
+    # Also search DB files by filename
+    db_files = db_query_all("SELECT id, filename FROM files WHERE filename LIKE ?", (f"%{query}%",))
+    for fid, fname in db_files:
+        hits.append({
+            "source": "document",
+            "file_id": fid,
+            "filename": fname,
+            "snippet": "",
+        })
+    result = {"query": query, "count": len(hits), "hits": hits[:k]}
+    # If Groq available, add a short synthesized answer from hits
+    if groq_available and hits:
+        try:
+            context = "\n".join([f"- {h.get('speaker','doc')}: {h.get('text', h.get('snippet',''))}" for h in hits[:k]])
+            prompt = (
+                "Given the user's query and the following snippets, produce a concise 2-3 sentence answer.\n"
+                f"Query: {query}\nSnippets:\n{context}"
+            )
+            response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100,
+                temperature=0.2,
+            )
+            result["answer"] = response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.debug(f"Groq search answer failed: {e}")
+    return result
 
 @app.get("/meetings/{meeting_id}/suggestions")
 async def get_suggestions(meeting_id: str):
@@ -408,20 +592,65 @@ async def get_suggestions(meeting_id: str):
 @app.post("/meetings/{meeting_id}/summarize")
 async def summarize_meeting(meeting_id: str):
     uts = transcripts.get(meeting_id, [])
-    last_texts = [u.text for u in uts[-10:]]
+    all_text = "\n".join([f"{u.speaker}: {u.text}" for u in uts[-100:]])
     files = [f.filename for f in uploaded_files.values()]
+    # Default summary
     summary = {
-        "summary": (
-            "This meeting discussed: " + ("; ".join(last_texts[:3]) or "general topics") + 
-            (". Referenced files: " + ", ".join(files) if files else ".")
-        ),
-        "key_points": last_texts[:5],
-        "action_items": [
-            "Review notes and finalize next steps",
-            "Follow up with stakeholders",
-        ],
+        "summary": "This meeting covered several topics.",
+        "key_points": [],
+        "action_items": [],
     }
+    if groq_available and all_text:
+        try:
+            prompt = (
+                "Summarize the following meeting transcript. Provide:\n"
+                "1) A concise 2-3 sentence summary\n"
+                "2) 3-5 bullet key points\n"
+                "3) 2-3 actionable next steps\n"
+                f"Transcript (truncated):\n{all_text}\n"
+                f"Files referenced: {', '.join(files) if files else 'none'}"
+            )
+            response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=250,
+                temperature=0.3,
+            )
+            content = response.choices[0].message.content.strip()
+            # simple parsing into sections
+            summary_text, key_points, action_items = parse_summary_text(content)
+            summary = {
+                "summary": summary_text,
+                "key_points": key_points,
+                "action_items": action_items,
+            }
+        except Exception as e:
+            logger.debug(f"Groq summarize failed, falling back: {e}")
+            last_texts = [u.text for u in uts[-10:]]
+            summary = {
+                "summary": (
+                    "This meeting discussed: " + ("; ".join(last_texts[:3]) or "general topics") +
+                    (". Referenced files: " + ", ".join(files) if files else ".")
+                ),
+                "key_points": last_texts[:5],
+                "action_items": ["Review notes and finalize next steps", "Follow up with stakeholders"],
+            }
+    else:
+        last_texts = [u.text for u in uts[-10:]]
+        summary = {
+            "summary": (
+                "This meeting discussed: " + ("; ".join(last_texts[:3]) or "general topics") +
+                (". Referenced files: " + ", ".join(files) if files else ".")
+            ),
+            "key_points": last_texts[:5],
+            "action_items": ["Review notes and finalize next steps", "Follow up with stakeholders"],
+        }
     summaries[meeting_id] = summary
+    # persist
+    db_execute(
+        "INSERT OR REPLACE INTO summaries (meeting_id, summary, key_points, action_items) VALUES (?,?,?,?)",
+        (meeting_id, summary["summary"], "\n".join(summary["key_points"]), "\n".join(summary["action_items"]))
+    )
     # Also broadcast as a suggestion card
     await manager.send_to_meeting(meeting_id, {
         "type": "suggestion",
@@ -437,7 +666,65 @@ async def summarize_meeting(meeting_id: str):
 
 @app.get("/meetings/{meeting_id}/summary")
 async def get_summary(meeting_id: str):
-    return summaries.get(meeting_id, {"summary": "No summary yet", "key_points": [], "action_items": []})
+    s = summaries.get(meeting_id)
+    if s:
+        return s
+    rows = db_query_all("SELECT summary, key_points, action_items FROM summaries WHERE meeting_id=?", (meeting_id,))
+    if rows:
+        summ, kp, ai = rows[0]
+        return {"summary": summ, "key_points": (kp.split("\n") if kp else []), "action_items": (ai.split("\n") if ai else [])}
+    return {"summary": "No summary yet", "key_points": [], "action_items": []}
+
+# --- Helpers ---
+def parse_summary_text(content: str):
+    lines = [l.strip() for l in content.splitlines() if l.strip()]
+    summary_lines, keys, acts = [], [], []
+    mode = "summary"
+    for l in lines:
+        low = l.lower()
+        if any(h in low for h in ["key points", "key bullets", "bullets", "points:"]):
+            mode = "keys"; continue
+        if any(h in low for h in ["action items", "next steps", "actions:"]):
+            mode = "acts"; continue
+        if mode == "summary":
+            summary_lines.append(l.strip("-• "))
+        elif mode == "keys":
+            keys.append(l.strip("-• "))
+        else:
+            acts.append(l.strip("-• "))
+    summary_text = " ".join(summary_lines) or (lines[0] if lines else content)
+    return summary_text, keys[:5], acts[:5]
+
+async def transcribe_audio_bytes(audio_bytes: bytes) -> str:
+    """Transcribe audio bytes using faster-whisper or OpenAI whisper if available. Returns empty string on failure."""
+    # Try faster-whisper
+    if FAST_WHISPER_AVAILABLE:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+                tmp.write(audio_bytes)
+                tmp.flush()
+                # Lazy load model to avoid startup hit
+                model = WhisperModel(os.getenv("WHISPER_MODEL", "tiny"), device="cpu", compute_type="int8")
+                segments, _ = model.transcribe(tmp.name, beam_size=1)
+                text = " ".join([seg.text.strip() for seg in segments])
+                return text.strip()
+        except Exception as e:
+            logger.debug(f"faster-whisper failed: {e}")
+    # Try OpenAI Whisper
+    if OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY"):
+        try:
+            client = OpenAIClient()
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+                tmp.write(audio_bytes)
+                tmp.flush()
+                with open(tmp.name, "rb") as fh:
+                    resp = client.audio.transcriptions.create(model="whisper-1", file=fh)
+                # resp.text depending on SDK; fallback to str
+                text = getattr(resp, "text", None) or str(resp)
+                return text.strip()
+        except Exception as e:
+            logger.debug(f"OpenAI whisper failed: {e}")
+    return ""
 
 @app.post("/suggestions/{suggestion_id}/approve")
 async def approve_suggestion(suggestion_id: str):
@@ -492,6 +779,19 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
         )
         
         uploaded_files[file_id] = uploaded_file
+        # persist file metadata (initial status: processing)
+        db_execute(
+            "INSERT OR REPLACE INTO files (id, filename, size, upload_time, status, content_type, file_hash) VALUES (?,?,?,?,?,?,?)",
+            (
+                file_id,
+                uploaded_file.filename,
+                uploaded_file.size,
+                uploaded_file.upload_time,
+                uploaded_file.status,
+                uploaded_file.content_type,
+                uploaded_file.file_hash,
+            ),
+        )
         
         # Simulate file processing
         await asyncio.sleep(2)  # Simulate processing time
@@ -504,6 +804,11 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
             "action_items": ["Review quarterly goals", "Update project timeline"],
             "word_count": len(content.split()) if file.content_type.startswith('text/') else "N/A"
         }
+        # update DB status to ready
+        db_execute(
+            "UPDATE files SET status=? WHERE id=?",
+            (uploaded_file.status, file_id),
+        )
         
         # Send file upload event to transcript
         if meeting_id in manager.active_connections:
@@ -1167,14 +1472,64 @@ async def get_demo():
             
             let mediaRecorder = null;
             let audioChunks = [];
+            let recognition = null; // Web Speech API
+
+            function hasWebSpeech() {
+                return 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;
+            }
+
+            function startASR() {
+                try {
+                    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+                    if (!SR) return false;
+                    recognition = new SR();
+                    recognition.continuous = true;
+                    recognition.interimResults = true;
+                    recognition.lang = 'en-US';
+                    recognition.onresult = (event) => {
+                        let finalText = '';
+                        for (let i = event.resultIndex; i < event.results.length; i++) {
+                            const res = event.results[i];
+                            const text = res[0].transcript.trim();
+                            if (!text) continue;
+                            // Stream partials/finals as chat messages to backend
+                            if (ws) {
+                                ws.send(JSON.stringify({ type: 'chat', text }));
+                            }
+                            if (res.isFinal) finalText += text + ' ';
+                        }
+                    };
+                    recognition.onerror = (e) => { console.warn('ASR error', e); };
+                    recognition.onend = () => { /* restart if still recording */ if (isRecording && recognition) recognition.start(); };
+                    recognition.start();
+                    isRecording = true;
+                    const recordBtn = document.getElementById('recordBtn');
+                    const recordText = document.getElementById('recordText');
+                    recordBtn.className = 'ai-button-primary bg-red-600 hover:bg-red-700';
+                    recordText.innerHTML = '<i data-lucide="square" class="h-4 w-4 mr-2"></i>Stop';
+                    lucide.createIcons();
+                    return true;
+                } catch (e) {
+                    console.warn('ASR init failed', e);
+                    return false;
+                }
+            }
+
+            function stopASR() {
+                try { if (recognition) { recognition.onend = null; recognition.stop(); } } catch(e) {}
+                recognition = null;
+            }
 
             function toggleRecording() {
                 if (!isConnected) return;
                 
                 if (isRecording) {
+                    stopASR();
                     stopRecording();
                 } else {
-                    startRecording();
+                    // Prefer Web Speech API streaming; fallback to MediaRecorder blob
+                    const started = hasWebSpeech() ? startASR() : false;
+                    if (!started) startRecording();
                 }
             }
 
