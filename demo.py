@@ -21,6 +21,12 @@ from pydantic import BaseModel
 from groq import Groq
 import tempfile
 import io
+import json as pyjson
+try:
+    import aiosqlite
+    AIOSQLITE_AVAILABLE = True
+except Exception:
+    AIOSQLITE_AVAILABLE = False
 try:
     from faster_whisper import WhisperModel  # optional
     FAST_WHISPER_AVAILABLE = True
@@ -180,6 +186,24 @@ def init_db():
             )
             """
         )
+        # Optional FTS5 (best-effort)
+        try:
+            cur.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
+                    meeting_id, speaker, text, timestamp
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+                    id, filename, summary
+                )
+                """
+            )
+        except Exception as _:
+            pass
         conn.commit()
         conn.close()
     except Exception as e:
@@ -205,6 +229,29 @@ def db_query_all(query: str, params: tuple = ()):  # safe read helper
         return rows
     except Exception as e:
         logger.debug(f"DB read skipped: {e}")
+        return []
+
+# Async DB helpers (used when available)
+async def adb_execute(query: str, params: tuple = ()):  # best-effort async write
+    if not AIOSQLITE_AVAILABLE:
+        return db_execute(query, params)
+    try:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            await conn.execute(query, params)
+            await conn.commit()
+    except Exception as e:
+        logger.debug(f"ADB write skipped: {e}")
+
+async def adb_query_all(query: str, params: tuple = ()):  # async read helper
+    if not AIOSQLITE_AVAILABLE:
+        return db_query_all(query, params)
+    try:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            async with conn.execute(query, params) as cur:
+                rows = await cur.fetchall()
+                return rows
+    except Exception as e:
+        logger.debug(f"ADB read skipped: {e}")
         return []
 
 # Create uploads directory
@@ -470,6 +517,11 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str):
                     "INSERT INTO transcripts (meeting_id, speaker, text, timestamp, confidence) VALUES (?,?,?,?,?)",
                     (meeting_id, utterance.speaker, utterance.text, utterance.timestamp, utterance.confidence)
                 )
+                # index into FTS (best-effort)
+                db_execute(
+                    "INSERT INTO transcripts_fts (meeting_id, speaker, text, timestamp) VALUES (?,?,?,?)",
+                    (meeting_id, utterance.speaker, utterance.text, utterance.timestamp)
+                )
             except Exception as _:
                 pass
             
@@ -514,7 +566,7 @@ async def end_meeting(meeting_id: str):
 async def get_transcript(meeting_id: str):
     items = [u.model_dump() for u in transcripts.get(meeting_id, [])]
     # also include from DB if any
-    rows = db_query_all(
+    rows = await adb_query_all(
         "SELECT speaker, text, timestamp, confidence FROM transcripts WHERE meeting_id=? ORDER BY id ASC",
         (meeting_id,),
     )
@@ -532,6 +584,33 @@ async def get_transcript(meeting_id: str):
 async def search(query: str, meeting_id: Optional[str] = None, k: int = 10):
     q = (query or "").lower()
     hits = []
+    # Try FTS5 first (best-effort)
+    try:
+        if meeting_id:
+            rows = await adb_query_all(
+                "SELECT speaker, text, timestamp FROM transcripts_fts WHERE text MATCH ? LIMIT ?",
+                (query, k),
+            )
+            for speaker, text, ts in rows:
+                hits.append({
+                    "source": "transcript",
+                    "speaker": speaker,
+                    "text": text,
+                    "timestamp": ts
+                })
+        rowsf = await adb_query_all(
+            "SELECT id, filename, summary FROM files_fts WHERE files_fts MATCH ? LIMIT ?",
+            (query, k),
+        )
+        for fid, fname, summ in rowsf:
+            hits.append({
+                "source": "document",
+                "file_id": fid,
+                "filename": fname,
+                "snippet": (summ or "")[:280]
+            })
+    except Exception:
+        pass
     # Search transcript
     if meeting_id and meeting_id in transcripts:
         for u in transcripts[meeting_id]:
@@ -553,7 +632,7 @@ async def search(query: str, meeting_id: Optional[str] = None, k: int = 10):
                 "snippet": (f.analysis or {}).get('summary', '')[:280]
             })
     # Also search DB files by filename
-    db_files = db_query_all("SELECT id, filename FROM files WHERE filename LIKE ?", (f"%{query}%",))
+    db_files = await adb_query_all("SELECT id, filename FROM files WHERE filename LIKE ?", (f"%{query}%",))
     for fid, fname in db_files:
         hits.append({
             "source": "document",
@@ -612,17 +691,27 @@ async def summarize_meeting(meeting_id: str):
             )
             response = groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "system", "content": "You output only JSON."}, {"role": "user", "content": (
+                    "Return a compact JSON object with keys: summary (string), key_points (array of 3-5 short strings), action_items (array of 2-4 short strings).\n" +
+                    "Make it strictly valid JSON and nothing else.\n\n" +
+                    prompt
+                )}],
                 max_tokens=250,
                 temperature=0.3,
             )
             content = response.choices[0].message.content.strip()
-            # simple parsing into sections
-            summary_text, key_points, action_items = parse_summary_text(content)
+            # Try strict JSON parse first
+            parsed = None
+            try:
+                parsed = pyjson.loads(content)
+            except Exception:
+                # fallback to naive parsing
+                summary_text, key_points, action_items = parse_summary_text(content)
+                parsed = {"summary": summary_text, "key_points": key_points, "action_items": action_items}
             summary = {
-                "summary": summary_text,
-                "key_points": key_points,
-                "action_items": action_items,
+                "summary": parsed.get("summary") or "",
+                "key_points": parsed.get("key_points") or [],
+                "action_items": parsed.get("action_items") or [],
             }
         except Exception as e:
             logger.debug(f"Groq summarize failed, falling back: {e}")
@@ -647,7 +736,7 @@ async def summarize_meeting(meeting_id: str):
         }
     summaries[meeting_id] = summary
     # persist
-    db_execute(
+    await adb_execute(
         "INSERT OR REPLACE INTO summaries (meeting_id, summary, key_points, action_items) VALUES (?,?,?,?)",
         (meeting_id, summary["summary"], "\n".join(summary["key_points"]), "\n".join(summary["action_items"]))
     )
@@ -809,6 +898,14 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
             "UPDATE files SET status=? WHERE id=?",
             (uploaded_file.status, file_id),
         )
+        # index into FTS (best-effort)
+        try:
+            db_execute(
+                "INSERT INTO files_fts (id, filename, summary) VALUES (?,?,?)",
+                (file_id, uploaded_file.filename, uploaded_file.analysis.get("summary", ""))
+            )
+        except Exception as _:
+            pass
         
         # Send file upload event to transcript
         if meeting_id in manager.active_connections:
@@ -916,7 +1013,10 @@ async def health_check():
         "status": "healthy", 
         "service": "ai-meeting-assistant",
         "groq_available": groq_available,
-        "groq_client": "Groq Client" if groq_client else None
+        "groq_client": "Groq Client" if groq_client else None,
+        "asr_server": (
+            "faster-whisper" if FAST_WHISPER_AVAILABLE else ("openai" if OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY") else "none")
+        )
     }
 
 # Serve the demo HTML with Co-pilot Nexus UI
@@ -1186,6 +1286,7 @@ async def get_demo():
                         <h1 class="text-3xl font-bold gradient-text">AI Meeting Assistant</h1>
                         <p class="text-gray-400 text-lg">Your intelligent co-pilot for productive meetings</p>
                     </div>
+                    <span id="asrEngineBadge" class="ml-auto badge bg-gray-700 text-gray-300">ASR: unknown</span>
                 </div>
                 <div class="flex items-center gap-2 text-sm text-gray-400">
                     <i data-lucide="sparkles" class="h-4 w-4"></i>
@@ -1552,7 +1653,8 @@ async def get_demo():
                         stream.getTracks().forEach(track => track.stop());
                     };
 
-                    mediaRecorder.start();
+                    // emit chunks every 500ms for steadier server-side ASR
+                    mediaRecorder.start(500);
                     isRecording = true;
                     
                     const recordBtn = document.getElementById('recordBtn');
