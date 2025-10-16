@@ -434,6 +434,40 @@ Respond with a concise suggestion (max 150 words) that would be helpful for this
                     "confidence": 0.85,
                     "reasons": ["AI analysis", "Contextual understanding"]
                 }
+
+            function performSemanticSearch() {
+                const query = document.getElementById('searchInput').value.trim();
+                if (!query) return;
+                const containerParent = document.getElementById('searchBtn').parentElement.parentElement;
+                let results = document.getElementById('searchResults');
+                if (!results) {
+                    results = document.createElement('div');
+                    results.id = 'searchResults';
+                    results.className = 'mt-4 space-y-2';
+                    containerParent.appendChild(results);
+                }
+                results.innerHTML = '<div class="text-sm text-gray-400">Semantic searching…</div>';
+                fetch(`/semantic_search?query=${encodeURIComponent(query)}&k=20`)
+                    .then(r => r.json())
+                    .then(data => {
+                        if (!data.hits || data.hits.length === 0) {
+                            results.innerHTML = '<div class="text-sm text-gray-400">No semantic matches.</div>';
+                            return;
+                        }
+                        const items = data.hits.map(h => {
+                            const meta = h.kind === 'transcript' ? `Transcript • ${h.timestamp||''}` : `Document • ${h.file_id||''}`;
+                            return `<div class="p-3 rounded bg-gray-800/60 border border-gray-700">
+                                <div class="text-xs text-gray-500 mb-1">${meta} • score ${h.score.toFixed(3)}</div>
+                                <div class="text-sm text-gray-200">${escapeHtml(h.text||'')}</div>
+                            </div>`;
+                        }).join('');
+                        results.innerHTML = `<div class="text-sm text-gray-400 mb-2">${data.count} semantic results</div>${items}`;
+                    })
+                    .catch(e => {
+                        console.error('Semantic search error', e);
+                        results.innerHTML = '<div class="text-sm text-red-400">Semantic search failed.</div>';
+                    });
+            }
                 logger.info("Successfully generated Groq AI suggestion")
             except Exception as groq_error:
                 logger.warning(f"Groq API error during processing: {groq_error}")
@@ -1674,6 +1708,9 @@ async def get_demo():
                                 <button id="searchBtn" class="ai-button-primary px-4" onclick="performSearch()">
                                     <i data-lucide="search" class="h-4 w-4"></i>
                                 </button>
+                                <button id="semanticSearchBtn" class="ai-button-secondary px-4" onclick="performSemanticSearch()">
+                                    <i data-lucide="sparkles" class="h-4 w-4"></i>
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -2331,6 +2368,40 @@ async def get_demo():
                     .catch(e => {
                         console.error('Search error', e);
                         results.innerHTML = '<div class="text-sm text-red-400">Search failed.</div>';
+                    });
+            }
+
+            function performSemanticSearch() {
+                const query = document.getElementById('searchInput').value.trim();
+                if (!query) return;
+                const containerParent = document.getElementById('searchBtn').parentElement.parentElement;
+                let results = document.getElementById('searchResults');
+                if (!results) {
+                    results = document.createElement('div');
+                    results.id = 'searchResults';
+                    results.className = 'mt-4 space-y-2';
+                    containerParent.appendChild(results);
+                }
+                results.innerHTML = '<div class="text-sm text-gray-400">Semantic searching…</div>';
+                fetch(`/semantic_search?query=${encodeURIComponent(query)}&k=20`)
+                    .then(r => r.json())
+                    .then(data => {
+                        if (!data.hits || data.hits.length === 0) {
+                            results.innerHTML = '<div class="text-sm text-gray-400">No semantic matches.</div>';
+                            return;
+                        }
+                        const items = data.hits.map(h => {
+                            const meta = h.kind === 'transcript' ? `Transcript • ${h.timestamp||''}` : `Document • ${h.file_id||''}`;
+                            return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\">\n`
+                                + `  <div class=\"text-xs text-gray-500 mb-1\">${meta} • score ${Number(h.score||0).toFixed(3)}</div>\n`
+                                + `  <div class=\"text-sm text-gray-200\">${escapeHtml(h.text||'')}</div>\n`
+                                + `</div>`;
+                        }).join('');
+                        results.innerHTML = `<div class=\"text-sm text-gray-400 mb-2\">${data.count} semantic results</div>${items}`;
+                    })
+                    .catch(e => {
+                        console.error('Semantic search error', e);
+                        results.innerHTML = '<div class="text-sm text-red-400">Semantic search failed.</div>';
                     });
             }
 
