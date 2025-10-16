@@ -22,6 +22,7 @@ from groq import Groq
 import tempfile
 import io
 import json as pyjson
+import math
 try:
     import aiosqlite
     AIOSQLITE_AVAILABLE = True
@@ -42,7 +43,21 @@ import sqlite3
 
 # Configure logging
 import logging
-logging.basicConfig(level=logging.INFO)
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record):
+        payload = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "level": record.levelname,
+            "msg": record.getMessage(),
+            "logger": record.name,
+        }
+        if hasattr(record, "extra") and isinstance(record.extra, dict):
+            payload.update(record.extra)
+        return pyjson.dumps(payload)
+
+handler = logging.StreamHandler()
+handler.setFormatter(JsonLogFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[handler])
 logger = logging.getLogger(__name__)
 
 # Create FastAPI app
@@ -61,6 +76,23 @@ app.add_middleware(
 DEMO_API_KEY = os.getenv("DEMO_API_KEY")  # if set, require X-API-Key header
 RATE_LIMIT_RPM = int(os.getenv("DEMO_RATE_LIMIT_RPM", "120"))
 _rate_buckets: Dict[str, list] = {}
+DEMO_JWT_SECRET = os.getenv("DEMO_JWT_SECRET")
+TOKEN_BUCKET_RPS = float(os.getenv("DEMO_RATE_LIMIT_RPS", "3"))
+TOKEN_BUCKET_BURST = int(os.getenv("DEMO_RATE_LIMIT_BURST", "10"))
+try:
+    import jwt  # PyJWT optional
+    JWT_AVAILABLE = True
+except Exception:
+    JWT_AVAILABLE = False
+
+# Metrics (simple counters)
+METRICS = {
+    "http_requests_total": 0,
+    "search_requests_total": 0,
+    "semantic_search_requests_total": 0,
+    "ws_transcripts_total": 0,
+    "asr_chunks_transcribed_total": 0,
+}
 
 @app.middleware("http")
 async def auth_and_rate_limit(request, call_next):
@@ -69,22 +101,31 @@ async def auth_and_rate_limit(request, call_next):
     if path in ("/", "/health"):
         return await call_next(request)
     # Auth
-    if DEMO_API_KEY:
+    if DEMO_JWT_SECRET and JWT_AVAILABLE and request.headers.get("Authorization", "").startswith("Bearer "):
+        token = request.headers.get("Authorization")[7:]
+        try:
+            jwt.decode(token, DEMO_JWT_SECRET, algorithms=["HS256"])  # payload unused
+        except Exception:
+            return HTMLResponse(status_code=401, content="Unauthorized")
+    elif DEMO_API_KEY:
         if request.headers.get("X-API-Key") != DEMO_API_KEY:
             return HTMLResponse(status_code=401, content="Unauthorized")
     # Rate limit per IP
     try:
         ip = request.client.host if request.client else "unknown"
+        b = _rate_buckets.setdefault(ip, [TOKEN_BUCKET_BURST, time.time()])  # [tokens, last_ts]
+        tokens, last_ts = b
         now = time.time()
-        window = 60.0
-        bucket = _rate_buckets.setdefault(ip, [])
-        # drop old
-        _rate_buckets[ip] = [t for t in bucket if now - t < window]
-        if len(_rate_buckets[ip]) >= RATE_LIMIT_RPM:
+        # refill
+        tokens = min(TOKEN_BUCKET_BURST, tokens + (now - last_ts) * TOKEN_BUCKET_RPS)
+        if tokens < 1:
+            _rate_buckets[ip] = [tokens, now]
             return HTMLResponse(status_code=429, content="Rate limit exceeded")
-        _rate_buckets[ip].append(now)
+        tokens -= 1
+        _rate_buckets[ip] = [tokens, now]
     except Exception:
         pass
+    METRICS["http_requests_total"] += 1
     return await call_next(request)
 
 # Data models
@@ -140,6 +181,12 @@ def init_db():
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
+        # performance/concurrency pragmas
+        try:
+            cur.execute("PRAGMA journal_mode=WAL;")
+            cur.execute("PRAGMA synchronous=NORMAL;")
+        except Exception:
+            pass
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS meetings (
@@ -203,6 +250,20 @@ def init_db():
                 """
             )
         except Exception as _:
+            pass
+        # Embeddings table (JSON vector for simplicity)
+        try:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT,
+                    text TEXT,
+                    vector TEXT
+                )
+                """
+            )
+        except Exception:
             pass
         conn.commit()
         conn.close()
@@ -300,6 +361,7 @@ initialize_groq()
 active_connections = {}
 init_db()
 audio_buffers: Dict[str, bytearray] = {}
+audio_last_flush: Dict[str, float] = {}
 
 # Simulated AI responses
 AI_RESPONSES = [
@@ -513,15 +575,30 @@ async def websocket_endpoint(websocket: WebSocket, meeting_id: str):
             transcripts[meeting_id].append(utterance)
             # persist transcript row
             try:
-                db_execute(
+                await adb_execute(
                     "INSERT INTO transcripts (meeting_id, speaker, text, timestamp, confidence) VALUES (?,?,?,?,?)",
                     (meeting_id, utterance.speaker, utterance.text, utterance.timestamp, utterance.confidence)
                 )
                 # index into FTS (best-effort)
-                db_execute(
+                await adb_execute(
                     "INSERT INTO transcripts_fts (meeting_id, speaker, text, timestamp) VALUES (?,?,?,?)",
                     (meeting_id, utterance.speaker, utterance.text, utterance.timestamp)
                 )
+                # upsert embedding
+                emb = compute_embedding(utterance.text)
+                await adb_execute(
+                    "INSERT OR REPLACE INTO embeddings (id, kind, text, vector) VALUES (?,?,?,?)",
+                    (f"T:{meeting_id}:{utterance.timestamp}", "transcript", utterance.text, pyjson.dumps(emb))
+                )
+                # fallback to simple text search if FTS fails
+                try:
+                    await adb_execute(
+                        "INSERT INTO transcripts_fts (meeting_id, speaker, text, timestamp) VALUES (?,?,?,?)",
+                        (meeting_id, utterance.speaker, utterance.text, utterance.timestamp)
+                    )
+                except Exception:
+                    pass
+                
             except Exception as _:
                 pass
             
@@ -542,7 +619,7 @@ async def start_meeting(metadata: MeetingData):
     meetings[metadata.meeting_id] = metadata
     logger.info(f"Started meeting {metadata.meeting_id}")
     # persist
-    db_execute(
+    await adb_execute(
         "INSERT OR REPLACE INTO meetings (meeting_id, title, platform, start_time, privacy_mode) VALUES (?,?,?,?,?)",
         (
             metadata.meeting_id,
@@ -641,24 +718,74 @@ async def search(query: str, meeting_id: Optional[str] = None, k: int = 10):
             "snippet": "",
         })
     result = {"query": query, "count": len(hits), "hits": hits[:k]}
-    # If Groq available, add a short synthesized answer from hits
+    # If Groq available, add a structured answer with citations
     if groq_available and hits:
         try:
-            context = "\n".join([f"- {h.get('speaker','doc')}: {h.get('text', h.get('snippet',''))}" for h in hits[:k]])
+            # Build labeled snippets for citations
+            labeled = []
+            for idx, h in enumerate(hits[:k]):
+                if h.get("source") == "transcript":
+                    label = f"T{idx}"
+                    labeled.append({"label": label, "type": "transcript", "timestamp": h.get("timestamp"), "speaker": h.get("speaker"), "text": h.get("text", "")})
+                else:
+                    label = f"D{idx}"
+                    labeled.append({"label": label, "type": "document", "file_id": h.get("file_id"), "filename": h.get("filename"), "text": h.get("snippet", "")})
+            prompt_context = "\n".join([f"[{x['label']}] ({x['type']}) {x.get('speaker','')}{'@'+x.get('timestamp','') if x['type']=='transcript' else ''}: {x['text']}" for x in labeled])
             prompt = (
-                "Given the user's query and the following snippets, produce a concise 2-3 sentence answer.\n"
-                f"Query: {query}\nSnippets:\n{context}"
+                "You are a helpful meeting assistant. Based on the user's query and the labeled snippets, "
+                "produce a brief answer as JSON with an 'answers' array. Each item has: text (string), sources (array of objects).\n"
+                "Each source is either {type:'transcript', label:'T#', timestamp:'...'} or {type:'document', label:'D#', file_id:'...'}\n"
+                "Return strictly valid JSON with only the 'answers' key.\n\n"
+                f"Query: {query}\nSnippets:\n{prompt_context}"
             )
             response = groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=100,
+                messages=[{"role": "system", "content": "You output only JSON."}, {"role": "user", "content": prompt}],
+                max_tokens=200,
                 temperature=0.2,
             )
-            result["answer"] = response.choices[0].message.content.strip()
+            content = response.choices[0].message.content.strip()
+            try:
+                parsed = pyjson.loads(content)
+                if isinstance(parsed, dict) and "answers" in parsed:
+                    result["answers"] = parsed["answers"]
+                else:
+                    result["answer"] = content
+            except Exception:
+                result["answer"] = content
         except Exception as e:
             logger.debug(f"Groq search answer failed: {e}")
     return result
+
+# Semantic search using embeddings
+@app.get("/semantic_search")
+async def semantic_search(query: str, k: int = 10):
+    METRICS["semantic_search_requests_total"] += 1
+    qv = compute_embedding(query)
+    # Pull candidates (limit for demo)
+    rows = await adb_query_all("SELECT id, kind, text, vector FROM embeddings LIMIT 1000", ())
+    scored = []
+    for _id, kind, text, vec_json in rows:
+        try:
+            v = pyjson.loads(vec_json)
+            score = cosine(qv, v)
+            scored.append((_id, kind, text, float(score)))
+        except Exception:
+            continue
+    scored.sort(key=lambda x: x[3], reverse=True)
+    hits = []
+    for _id, kind, text, score in scored[:k]:
+        entry = {"id": _id, "kind": kind, "text": text, "score": score}
+        if kind == "transcript" and _id.startswith("T:"):
+            try:
+                _, meeting_id, ts = _id.split(":", 2)
+                entry.update({"meeting_id": meeting_id, "timestamp": ts})
+            except Exception:
+                pass
+        if kind == "document" and _id.startswith("D:"):
+            entry["file_id"] = _id[2:]
+        hits.append(entry)
+    return {"query": query, "count": len(hits), "hits": hits}
 
 @app.get("/meetings/{meeting_id}/suggestions")
 async def get_suggestions(meeting_id: str):
@@ -784,6 +911,50 @@ def parse_summary_text(content: str):
     summary_text = " ".join(summary_lines) or (lines[0] if lines else content)
     return summary_text, keys[:5], acts[:5]
 
+# Embedding helpers
+try:
+    from sentence_transformers import SentenceTransformer  # optional heavy dep
+    _st_model = None
+    SENTENCE_TRANS_AVAILABLE = True
+except Exception:
+    SENTENCE_TRANS_AVAILABLE = False
+
+def lazy_st_model():
+    global _st_model
+    if _st_model is None and SENTENCE_TRANS_AVAILABLE:
+        name = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        _st_model = SentenceTransformer(name)
+    return _st_model
+
+def hash_embed(text: str, dim: int = 256) -> List[float]:
+    # Simple hashing trick embedding as fallback
+    vec = [0.0] * dim
+    for token in (text or "").lower().split():
+        h = int(hashlib.md5(token.encode()).hexdigest(), 16)
+        idx = h % dim
+        vec[idx] += 1.0
+    # L2 normalize
+    norm = math.sqrt(sum(v*v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+def compute_embedding(text: str) -> List[float]:
+    try:
+        model = lazy_st_model()
+        if model is not None:
+            v = model.encode([text])[0]
+            # Normalize
+            norm = float((v**2).sum())**0.5 if hasattr(v, "sum") else math.sqrt(sum(float(x)*float(x) for x in v))
+            return [float(x)/ (norm or 1.0) for x in (v.tolist() if hasattr(v, "tolist") else v)]
+    except Exception as e:
+        logger.debug(f"ST embedding failed: {e}")
+    return hash_embed(text)
+
+def cosine(a: List[float], b: List[float]) -> float:
+    s = 0.0
+    for i in range(min(len(a), len(b))):
+        s += a[i]*b[i]
+    return s
+
 async def transcribe_audio_bytes(audio_bytes: bytes) -> str:
     """Transcribe audio bytes using faster-whisper or OpenAI whisper if available. Returns empty string on failure."""
     # Try faster-whisper
@@ -869,7 +1040,7 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
         
         uploaded_files[file_id] = uploaded_file
         # persist file metadata (initial status: processing)
-        db_execute(
+        await adb_execute(
             "INSERT OR REPLACE INTO files (id, filename, size, upload_time, status, content_type, file_hash) VALUES (?,?,?,?,?,?,?)",
             (
                 file_id,
@@ -886,25 +1057,62 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
         await asyncio.sleep(2)  # Simulate processing time
         
         # Update file status
+        # Optional text extraction for search quality
+        extracted_text = None
+        try:
+            fname = (file.filename or "").lower()
+            if file.content_type == "application/pdf" or fname.endswith(".pdf"):
+                try:
+                    import pypdf  # type: ignore
+                    reader = pypdf.PdfReader(io.BytesIO(content))
+                    pages = [page.extract_text() or "" for page in reader.pages]
+                    extracted_text = "\n".join(pages)
+                except Exception:
+                    extracted_text = None
+            elif file.content_type in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",) or fname.endswith(".docx"):
+                try:
+                    import docx  # type: ignore
+                    doc = docx.Document(io.BytesIO(content))
+                    extracted_text = "\n".join(p.text for p in doc.paragraphs)
+                except Exception:
+                    extracted_text = None
+            elif file.content_type.startswith("text/") or fname.endswith((".txt", ".md")):
+                try:
+                    extracted_text = content.decode("utf-8", errors="replace")
+                except Exception:
+                    extracted_text = None
+        except Exception:
+            extracted_text = None
+
         uploaded_file.status = "ready"
+        summary_blob = extracted_text[:1000] + "..." if extracted_text and len(extracted_text) > 1000 else (extracted_text or f"Document '{file.filename}' has been processed and indexed for analysis.")
         uploaded_file.analysis = {
-            "summary": f"Document '{file.filename}' has been processed and indexed for analysis.",
+            "summary": summary_blob,
             "key_topics": ["strategy", "planning", "objectives"],
             "action_items": ["Review quarterly goals", "Update project timeline"],
-            "word_count": len(content.split()) if file.content_type.startswith('text/') else "N/A"
+            "word_count": len(extracted_text.split()) if extracted_text else (len(content.split()) if file.content_type.startswith('text/') else "N/A")
         }
         # update DB status to ready
-        db_execute(
+        await adb_execute(
             "UPDATE files SET status=? WHERE id=?",
             (uploaded_file.status, file_id),
         )
         # index into FTS (best-effort)
         try:
-            db_execute(
+            await adb_execute(
                 "INSERT INTO files_fts (id, filename, summary) VALUES (?,?,?)",
                 (file_id, uploaded_file.filename, uploaded_file.analysis.get("summary", ""))
             )
         except Exception as _:
+            pass
+        # upsert embedding for file summary
+        try:
+            emb = compute_embedding(uploaded_file.analysis.get("summary", ""))
+            await adb_execute(
+                "INSERT OR REPLACE INTO embeddings (id, kind, text, vector) VALUES (?,?,?,?)",
+                (f"D:{file_id}", "document", uploaded_file.analysis.get("summary", ""), pyjson.dumps(emb))
+            )
+        except Exception:
             pass
         
         # Send file upload event to transcript
@@ -1016,8 +1224,14 @@ async def health_check():
         "groq_client": "Groq Client" if groq_client else None,
         "asr_server": (
             "faster-whisper" if FAST_WHISPER_AVAILABLE else ("openai" if OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY") else "none")
-        )
+        ),
+        "embeddings": "sentence-transformers" if SENTENCE_TRANS_AVAILABLE else "hashing",
     }
+
+@app.get("/metrics")
+async def metrics():
+    # Simple JSON metrics for demo
+    return METRICS
 
 # Serve the demo HTML with Co-pilot Nexus UI
 @app.get("/")
@@ -1634,21 +1848,53 @@ async def get_demo():
                 }
             }
 
+            let audioCtx = null, srcNode = null, analyser = null, vadRaf = 0;
+            let vadSpeaking = false, vadLastVoice = 0;
+
             async function startRecording() {
                 try {
                     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
                     mediaRecorder = new MediaRecorder(stream);
                     audioChunks = [];
 
+                    // Setup WebAudio for simple VAD
+                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    srcNode = audioCtx.createMediaStreamSource(stream);
+                    analyser = audioCtx.createAnalyser();
+                    analyser.fftSize = 2048;
+                    srcNode.connect(analyser);
+                    const dataArr = new Uint8Array(analyser.fftSize);
+                    const VAD_RMS_TH = 0.04; // tune as needed
+                    const VAD_SIL_MS = 600;  // ms of silence before gating off
+                    const postVoiceMs = 400; // grace period after speech
+                    function loopVAD(){
+                        if (!analyser) return;
+                        analyser.getByteTimeDomainData(dataArr);
+                        let sum=0; for(let i=0;i<dataArr.length;i++){ const v=(dataArr[i]-128)/128; sum+=v*v; }
+                        const rms = Math.sqrt(sum/dataArr.length);
+                        const now = performance.now();
+                        if (rms > VAD_RMS_TH){ vadSpeaking = true; vadLastVoice = now; }
+                        else if (now - vadLastVoice > VAD_SIL_MS){ vadSpeaking = false; }
+                        vadRaf = requestAnimationFrame(loopVAD);
+                    }
+                    vadRaf = requestAnimationFrame(loopVAD);
+
                     mediaRecorder.ondataavailable = function(event) {
-                        audioChunks.push(event.data);
+                        if (event.data.size > 0) {
+                            const withinGrace = (performance.now() - vadLastVoice) < 400;
+                            if (vadSpeaking || withinGrace) {
+                                audioChunks.push(event.data);
+                                if (ws && ws.readyState === 1) {
+                                    try { ws.send(event.data); } catch (e) { /* ignore */ }
+                                }
+                            }
+                        }
                     };
 
                     mediaRecorder.onstop = function() {
                         const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-                        // Send audio data to WebSocket
-                        if (ws) {
-                            ws.send(audioBlob);
+                        if (ws && ws.readyState === 1) {
+                            try { ws.send(audioBlob); } catch(e) { /* ignore */ }
                         }
                         stream.getTracks().forEach(track => track.stop());
                     };
@@ -1671,15 +1917,23 @@ async def get_demo():
 
             function stopRecording() {
                 if (mediaRecorder && isRecording) {
-                    mediaRecorder.stop();
+                    try { mediaRecorder.stop(); } catch(_) {}
                     isRecording = false;
-                    
-                    const recordBtn = document.getElementById('recordBtn');
-                    const recordText = document.getElementById('recordText');
-                    recordBtn.className = 'ai-button-primary';
-                    recordText.innerHTML = '<i data-lucide="mic" class="h-4 w-4 mr-2"></i>Record';
-                    lucide.createIcons();
                 }
+                // VAD cleanup
+                try { if (vadRaf) cancelAnimationFrame(vadRaf); } catch(_) {}
+                vadRaf = 0; vadSpeaking = false; vadLastVoice = 0;
+                try { if (srcNode) srcNode.disconnect(); } catch(_) {}
+                try { if (analyser) analyser.disconnect(); } catch(_) {}
+                srcNode = null; analyser = null;
+                try { if (audioCtx) audioCtx.close(); } catch(_) {}
+                audioCtx = null;
+                
+                const recordBtn = document.getElementById('recordBtn');
+                const recordText = document.getElementById('recordText');
+                recordBtn.className = 'ai-button-primary';
+                recordText.innerHTML = '<i data-lucide="mic" class="h-4 w-4 mr-2"></i>Record';
+                lucide.createIcons();
             }
             
             async function connect() {
@@ -2028,30 +2282,60 @@ async def get_demo():
                 fetch(`/search?query=${encodeURIComponent(query)}&meeting_id=${encodeURIComponent(meetingId)}&k=20`)
                     .then(r => r.json())
                     .then(data => {
+                        // Render synthesized answers with citations if present
+                        let answerHtml = '';
+                        if (Array.isArray(data.answers)) {
+                            const items = data.answers.map(a => {
+                                const sources = (a.sources||[]).map(s => {
+                                    if (s.type === 'transcript') return `<span class="text-xs text-gray-400">[${s.label} @ ${s.timestamp||''}]</span>`;
+                                    if (s.type === 'document') return `<span class="text-xs text-gray-400">[${s.label} ${s.file_id||''}]</span>`;
+                                    return '';
+                                }).join(' ');
+                                return `<div class="p-3 rounded bg-gray-800/60 border border-gray-700">
+                                    <div class="text-sm text-gray-200">${escapeHtml(a.text||'')}</div>
+                                    <div class="mt-1">${sources}</div>
+                                </div>`;
+                            }).join('');
+                            answerHtml = `<div class="mb-2"><div class="text-sm text-purple-300 mb-1">Answer</div>${items}</div>`;
+                        } else if (data.answer) {
+                            answerHtml = `<div class="mb-2"><div class="text-sm text-purple-300 mb-1">Answer</div><div class="text-sm text-gray-200">${escapeHtml(data.answer)}</div></div>`;
+                        }
                         if (!data.hits || data.hits.length === 0) {
-                            results.innerHTML = '<div class="text-sm text-gray-400">No results.</div>';
+                            results.innerHTML = answerHtml || '<div class="text-sm text-gray-400">No results.</div>';
                             return;
                         }
+                        // Simple highlighter
+                        const hi = (t)=> (t||'').replace(new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'ig'), m=>`<mark class="bg-yellow-600/40 px-1 rounded">${m}</mark>`);
                         const items = data.hits.map(h => {
                             if (h.source === 'transcript') {
                                 return `<div class="p-3 rounded bg-gray-800/60 border border-gray-700">
                                     <div class="text-xs text-gray-500 mb-1">Transcript • ${new Date(h.timestamp).toLocaleTimeString()}</div>
-                                    <div class="text-sm text-gray-200"><strong>${h.speaker}:</strong> ${h.text}</div>
+                                    <div class="text-sm text-gray-200"><strong>${escapeHtml(h.speaker)}:</strong> ${hi(escapeHtml(h.text))}</div>
                                 </div>`;
                             } else {
                                 return `<div class="p-3 rounded bg-gray-800/60 border border-gray-700">
-                                    <div class="text-xs text-gray-500 mb-1">Document • ${h.filename || ''}</div>
-                                    <div class="text-sm text-gray-200">${h.snippet || ''}</div>
+                                    <div class="text-xs text-gray-500 mb-1">Document • ${escapeHtml(h.filename || '')}</div>
+                                    <div class="text-sm text-gray-200">${hi(escapeHtml(h.snippet || ''))}</div>
                                 </div>`;
                             }
                         }).join('');
-                        results.innerHTML = `<div class="text-sm text-gray-400 mb-2">${data.count} results</div>${items}`;
+                        // Filters UI
+                        const filters = `<div class="flex gap-2 mb-2 text-xs"><button id="filterAll" class="px-2 py-1 rounded bg-gray-700">All</button><button id="filterTranscript" class="px-2 py-1 rounded bg-gray-700">Transcript</button><button id="filterDocs" class="px-2 py-1 rounded bg-gray-700">Docs</button></div>`;
+                        results.innerHTML = `${answerHtml}<div class="text-sm text-gray-400 mb-2">${data.count} results</div>${filters}<div id="searchList">${items}</div>`;
+                        // Filter behavior
+                        const listEl = document.getElementById('searchList');
+                        document.getElementById('filterAll').onclick = ()=>{ Array.from(listEl.children).forEach(c=>c.style.display='block'); };
+                        document.getElementById('filterTranscript').onclick = ()=>{ Array.from(listEl.children).forEach(c=>{ c.querySelector('.text-xs')?.textContent.includes('Transcript') ? c.style.display='block' : c.style.display='none'; }); };
+                        document.getElementById('filterDocs').onclick = ()=>{ Array.from(listEl.children).forEach(c=>{ c.querySelector('.text-xs')?.textContent.includes('Document') ? c.style.display='block' : c.style.display='none'; }); };
                     })
                     .catch(e => {
                         console.error('Search error', e);
                         results.innerHTML = '<div class="text-sm text-red-400">Search failed.</div>';
                     });
             }
+
+            // Basic HTML escaper
+            function escapeHtml(s){ return (s||'').replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]||c)); }
 
             // Drag and drop functionality
             const uploadArea = document.getElementById('fileUploadArea');
