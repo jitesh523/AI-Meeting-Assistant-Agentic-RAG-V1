@@ -434,40 +434,6 @@ Respond with a concise suggestion (max 150 words) that would be helpful for this
                     "confidence": 0.85,
                     "reasons": ["AI analysis", "Contextual understanding"]
                 }
-
-            function performSemanticSearch() {
-                const query = document.getElementById('searchInput').value.trim();
-                if (!query) return;
-                const containerParent = document.getElementById('searchBtn').parentElement.parentElement;
-                let results = document.getElementById('searchResults');
-                if (!results) {
-                    results = document.createElement('div');
-                    results.id = 'searchResults';
-                    results.className = 'mt-4 space-y-2';
-                    containerParent.appendChild(results);
-                }
-                results.innerHTML = '<div class="text-sm text-gray-400">Semantic searching…</div>';
-                fetch(`/semantic_search?query=${encodeURIComponent(query)}&k=20`)
-                    .then(r => r.json())
-                    .then(data => {
-                        if (!data.hits || data.hits.length === 0) {
-                            results.innerHTML = '<div class="text-sm text-gray-400">No semantic matches.</div>';
-                            return;
-                        }
-                        const items = data.hits.map(h => {
-                            const meta = h.kind === 'transcript' ? `Transcript • ${h.timestamp||''}` : `Document • ${h.file_id||''}`;
-                            return `<div class="p-3 rounded bg-gray-800/60 border border-gray-700">
-                                <div class="text-xs text-gray-500 mb-1">${meta} • score ${h.score.toFixed(3)}</div>
-                                <div class="text-sm text-gray-200">${escapeHtml(h.text||'')}</div>
-                            </div>`;
-                        }).join('');
-                        results.innerHTML = `<div class="text-sm text-gray-400 mb-2">${data.count} semantic results</div>${items}`;
-                    })
-                    .catch(e => {
-                        console.error('Semantic search error', e);
-                        results.innerHTML = '<div class="text-sm text-red-400">Semantic search failed.</div>';
-                    });
-            }
                 logger.info("Successfully generated Groq AI suggestion")
             except Exception as groq_error:
                 logger.warning(f"Groq API error during processing: {groq_error}")
@@ -793,7 +759,7 @@ async def search(query: str, meeting_id: Optional[str] = None, k: int = 10):
 
 # Semantic search using embeddings
 @app.get("/semantic_search")
-async def semantic_search(query: str, k: int = 10):
+async def semantic_search(query: str, page: int = 1, per_page: int = 10):
     METRICS["semantic_search_requests_total"] += 1
     qv = compute_embedding(query)
     # Pull candidates (limit for demo)
@@ -807,8 +773,14 @@ async def semantic_search(query: str, k: int = 10):
         except Exception:
             continue
     scored.sort(key=lambda x: x[3], reverse=True)
+    total = len(scored)
+    if page < 1:
+        page = 1
+    start = (page - 1) * max(1, per_page)
+    end = start + max(1, per_page)
+    slice_items = scored[start:end]
     hits = []
-    for _id, kind, text, score in scored[:k]:
+    for _id, kind, text, score in slice_items:
         entry = {"id": _id, "kind": kind, "text": text, "score": score}
         if kind == "transcript" and _id.startswith("T:"):
             try:
@@ -819,7 +791,7 @@ async def semantic_search(query: str, k: int = 10):
         if kind == "document" and _id.startswith("D:"):
             entry["file_id"] = _id[2:]
         hits.append(entry)
-    return {"query": query, "count": len(hits), "hits": hits}
+    return {"query": query, "page": page, "per_page": per_page, "total": total, "count": len(hits), "hits": hits}
 
 @app.get("/meetings/{meeting_id}/suggestions")
 async def get_suggestions(meeting_id: str):
@@ -1146,6 +1118,16 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
                 "INSERT OR REPLACE INTO embeddings (id, kind, text, vector) VALUES (?,?,?,?)",
                 (f"D:{file_id}", "document", uploaded_file.analysis.get("summary", ""), pyjson.dumps(emb))
             )
+        except Exception:
+            pass
+        # upsert embedding for full document text if available
+        try:
+            if extracted_text:
+                emb_full = compute_embedding(extracted_text[:5000])  # cap for speed
+                await adb_execute(
+                    "INSERT OR REPLACE INTO embeddings (id, kind, text, vector) VALUES (?,?,?,?)",
+                    (f"DTXT:{file_id}", "document", extracted_text[:5000], pyjson.dumps(emb_full))
+                )
         except Exception:
             pass
         
@@ -1699,18 +1681,23 @@ async def get_demo():
                             <!-- Files will be added here dynamically -->
                         </div>
 
-                        <!-- Search Box -->
+                        <!-- Search Tabs -->
                         <div class="space-y-2">
                             <h4 class="text-sm font-medium text-gray-300">Search Documents & Transcript</h4>
-                            <div class="flex gap-2">
-                                <input type="text" id="searchInput" class="ai-input flex-1" 
-                                       placeholder="Search across all content...">
-                                <button id="searchBtn" class="ai-button-primary px-4" onclick="performSearch()">
-                                    <i data-lucide="search" class="h-4 w-4"></i>
-                                </button>
-                                <button id="semanticSearchBtn" class="ai-button-secondary px-4" onclick="performSemanticSearch()">
-                                    <i data-lucide="sparkles" class="h-4 w-4"></i>
-                                </button>
+                            <div class="flex gap-2 items-center">
+                                <input type="text" id="searchInput" class="ai-input flex-1" placeholder="Search across all content...">
+                                <div class="flex gap-1" role="tablist">
+                                    <button id="tabKeyword" class="ai-button-secondary px-3 py-1 text-sm" onclick="activateTab('keyword')">Keyword</button>
+                                    <button id="tabSemantic" class="ai-button-secondary px-3 py-1 text-sm" onclick="activateTab('semantic')">Semantic</button>
+                                </div>
+                            </div>
+                            <div id="searchControls" class="flex gap-2">
+                                <button id="searchBtn" class="ai-button-primary px-4" onclick="performSearch()"><i data-lucide="search" class="h-4 w-4"></i></button>
+                                <div id="semanticPager" class="hidden items-center gap-2 text-xs">
+                                    <button class="ai-button-secondary px-2" onclick="semanticPrev()">Prev</button>
+                                    <span id="semanticPageLabel" class="text-gray-400">Page 1</span>
+                                    <button class="ai-button-secondary px-2" onclick="semanticNext()">Next</button>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -2303,6 +2290,22 @@ async def get_demo():
                 }
             }
 
+            let activeTab = 'keyword';
+            function activateTab(tab){
+                activeTab = tab;
+                const k = document.getElementById('tabKeyword');
+                const s = document.getElementById('tabSemantic');
+                if (tab==='keyword'){
+                    k.className='ai-button-primary px-3 py-1 text-sm'; s.className='ai-button-secondary px-3 py-1 text-sm';
+                    document.getElementById('semanticPager').classList.add('hidden');
+                } else {
+                    s.className='ai-button-primary px-3 py-1 text-sm'; k.className='ai-button-secondary px-3 py-1 text-sm';
+                    document.getElementById('semanticPager').classList.remove('hidden');
+                }
+                // auto-run current tab
+                if (tab==='keyword') performSearch(); else performSemanticSearch();
+            }
+
             function performSearch() {
                 const query = document.getElementById('searchInput').value.trim();
                 if (!query) return;
@@ -2371,6 +2374,10 @@ async def get_demo():
                     });
             }
 
+            let semPage = 1;
+            function semanticPrev(){ if (semPage>1){ semPage--; performSemanticSearch(); } }
+            function semanticNext(){ semPage++; performSemanticSearch(); }
+
             function performSemanticSearch() {
                 const query = document.getElementById('searchInput').value.trim();
                 if (!query) return;
@@ -2383,7 +2390,7 @@ async def get_demo():
                     containerParent.appendChild(results);
                 }
                 results.innerHTML = '<div class="text-sm text-gray-400">Semantic searching…</div>';
-                fetch(`/semantic_search?query=${encodeURIComponent(query)}&k=20`)
+                fetch(`/semantic_search?query=${encodeURIComponent(query)}&page=${semPage}&per_page=10`)
                     .then(r => r.json())
                     .then(data => {
                         if (!data.hits || data.hits.length === 0) {
@@ -2397,7 +2404,9 @@ async def get_demo():
                                 + `  <div class=\"text-sm text-gray-200\">${escapeHtml(h.text||'')}</div>\n`
                                 + `</div>`;
                         }).join('');
-                        results.innerHTML = `<div class=\"text-sm text-gray-400 mb-2\">${data.count} semantic results</div>${items}`;
+                        const total = data.total || data.count || 0;
+                        document.getElementById('semanticPageLabel').textContent = `Page ${data.page||semPage}`;
+                        results.innerHTML = `<div class=\"text-sm text-gray-400 mb-2\">${total} semantic results</div>${items}`;
                     })
                     .catch(e => {
                         console.error('Semantic search error', e);
