@@ -877,6 +877,60 @@ async def hybrid_search(query: str, meeting_id: Optional[str] = None, alpha: flo
     hits = scored[:k]
     return {"query": query, "alpha": alpha, "k": k, "count": len(hits), "hits": hits}
 
+@app.post("/ask")
+async def ask(payload: dict):
+    q = (payload.get("query") or "").strip()
+    meeting_id = payload.get("meeting_id")
+    k = int(payload.get("k", 6))
+    alpha = float(payload.get("alpha", 0.6))
+    if not q:
+        raise HTTPException(status_code=400, detail="query required")
+    # gather candidates
+    sem = await semantic_search(q, page=1, per_page=k)
+    hyb = await hybrid_search(q, meeting_id=meeting_id, alpha=alpha, k=k)
+    # dedupe, prefer hybrid order
+    seen = set()
+    cands = []
+    for h in hyb["hits"] + sem["hits"]:
+        _id = h.get("id")
+        if _id in seen:
+            continue
+        seen.add(_id)
+        cands.append(h)
+        if len(cands) >= k:
+            break
+    # build context
+    ctx_lines = []
+    citations = []
+    for i, h in enumerate(cands, 1):
+        meta = []
+        if h.get("file_id"):
+            meta.append(f"file:{h['file_id']}")
+        if isinstance(h.get("page_idx"), int):
+            meta.append(f"page:{h['page_idx']+1}")
+        if h.get("meeting_id"):
+            meta.append(f"mtg:{h['meeting_id']}")
+        label = ";".join(meta)
+        ctx_lines.append(f"[{i}] {h.get('text','')}")
+        citations.append({"idx": i, "id": h.get("id"), "label": label, "file_id": h.get("file_id"), "page_idx": h.get("page_idx")})
+    prompt = ("Answer the user question concisely using the context chunks below. Cite sources by their [index] like [1], [2].\n\n"+
+              "Context:\n"+"\n".join(ctx_lines)+"\n\nQuestion: "+q)
+    answer = ""
+    if groq_available and groq_client:
+        try:
+            resp = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role":"user","content": prompt}],
+                max_tokens=300,
+                temperature=0.2,
+            )
+            answer = resp.choices[0].message.content.strip()
+        except Exception as e:
+            logger.debug(f"/ask groq error: {e}")
+    if not answer:
+        answer = "Based on the provided context: " + (cands[0].get("text","")[:200] if cands else "No context available.")
+    return {"query": q, "answer": answer, "citations": citations}
+
 @app.get("/meetings/{meeting_id}/suggestions")
 async def get_suggestions(meeting_id: str):
     return {
@@ -1200,8 +1254,8 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
         try:
             emb = compute_embedding(uploaded_file.analysis.get("summary", ""))
             await adb_execute(
-                "INSERT OR REPLACE INTO embeddings (id, kind, text, vector) VALUES (?,?,?,?)",
-                (f"D:{file_id}", "document", uploaded_file.analysis.get("summary", ""), pyjson.dumps(emb))
+                "INSERT OR REPLACE INTO embeddings (id, kind, text, vector, file_id) VALUES (?,?,?,?,?)",
+                (f"D:{file_id}", "document", uploaded_file.analysis.get("summary", ""), pyjson.dumps(emb), file_id)
             )
         except Exception:
             pass
@@ -1222,8 +1276,8 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
                                 continue
                             emb_page = compute_embedding(chunk)
                             await adb_execute(
-                                "INSERT OR REPLACE INTO embeddings (id, kind, text, vector) VALUES (?,?,?,?)",
-                                (f"DPG:{file_id}:{p_idx}:{c_idx//chunk_size}", "document", chunk, pyjson.dumps(emb_page))
+                                "INSERT OR REPLACE INTO embeddings (id, kind, text, vector, file_id, page_idx, chunk_idx) VALUES (?,?,?,?,?,?,?)",
+                                (f"DPG:{file_id}:{p_idx}:{c_idx//chunk_size}", "document", chunk, pyjson.dumps(emb_page), file_id, p_idx, c_idx//chunk_size)
                             )
                 else:
                     chunk_size = 1000
@@ -1235,8 +1289,8 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
                             continue
                         emb_full = compute_embedding(chunk)
                         await adb_execute(
-                            "INSERT OR REPLACE INTO embeddings (id, kind, text, vector) VALUES (?,?,?,?)",
-                            (f"DTXT:{file_id}:{idx//chunk_size}", "document", chunk, pyjson.dumps(emb_full))
+                            "INSERT OR REPLACE INTO embeddings (id, kind, text, vector, file_id, chunk_idx) VALUES (?,?,?,?,?,?)",
+                            (f"DTXT:{file_id}:{idx//chunk_size}", "document", chunk, pyjson.dumps(emb_full), file_id, idx//chunk_size)
                         )
         except Exception:
             pass
@@ -1295,6 +1349,23 @@ async def get_raw_file(file_id: str):
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found on disk")
     return FileResponse(file_path, filename=f.filename)
+
+@app.get("/files/view/{file_id}")
+async def view_file(file_id: str):
+    if file_id not in uploaded_files:
+        raise HTTPException(status_code=404, detail="File not found")
+    f = uploaded_files[file_id]
+    src = f"/files/raw/{file_id}"
+    html = f"""
+    <!DOCTYPE html>
+    <html><head><meta charset='utf-8'><title>View {f.filename}</title>
+    <style>html,body,#viewer{{height:100%;margin:0}}</style>
+    </head>
+    <body>
+      <iframe id="viewer" src="https://mozilla.github.io/pdf.js/web/viewer.html?file={src}" style="width:100%; height:100%; border:0"></iframe>
+    </body></html>
+    """
+    return HTMLResponse(content=html)
 
 @app.post("/files/{file_id}/action")
 async def perform_file_action(file_id: str, action: FileAction):
