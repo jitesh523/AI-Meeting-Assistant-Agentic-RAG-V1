@@ -790,8 +790,91 @@ async def semantic_search(query: str, page: int = 1, per_page: int = 10):
                 pass
         if kind == "document" and _id.startswith("D:"):
             entry["file_id"] = _id[2:]
+        if kind == "document" and _id.startswith("DPG:"):
+            # DPG:{file_id}:{page_idx}:{chunk_idx}
+            try:
+                _, fid, pidx, _c = _id.split(":", 3)
+                entry["file_id"] = fid
+                entry["page_idx"] = int(pidx)
+            except Exception:
+                pass
         hits.append(entry)
     return {"query": query, "page": page, "per_page": per_page, "total": total, "count": len(hits), "hits": hits}
+
+# Hybrid search combining keyword (FTS) and semantic (embeddings)
+@app.get("/hybrid_search")
+async def hybrid_search(query: str, meeting_id: Optional[str] = None, alpha: float = 0.5, k: int = 10):
+    alpha = max(0.0, min(1.0, float(alpha)))
+    # Keyword candidates from FTS tables
+    tokens = [t for t in (query or "").lower().split() if t]
+    kw_items = []
+    try:
+        if meeting_id:
+            rows = await adb_query_all("SELECT meeting_id, speaker, text, timestamp FROM transcripts_fts WHERE text MATCH ? LIMIT 200", (query,))
+        else:
+            rows = await adb_query_all("SELECT meeting_id, speaker, text, timestamp FROM transcripts_fts LIMIT 200", ())
+        for m, sp, txt, ts in rows:
+            score = sum(txt.lower().count(t) for t in tokens)
+            kid = f"FTS:T:{m}:{ts}"
+            kw_items.append((kid, "transcript", txt, score, {"meeting_id": m, "timestamp": ts}))
+    except Exception:
+        pass
+    try:
+        frows = await adb_query_all("SELECT id, filename, summary FROM files_fts LIMIT 200", ())
+        for fid, fname, summ in frows:
+            score = sum((summ or "").lower().count(t) for t in tokens)
+            kid = f"FTS:D:{fid}"
+            kw_items.append((kid, "document", summ or "", score, {"file_id": fid}))
+    except Exception:
+        pass
+    max_kw = max((s for _i,_k,_t,s,_m in kw_items), default=1.0) or 1.0
+
+    # Semantic candidates from embeddings
+    qv = compute_embedding(query)
+    erows = await adb_query_all("SELECT id, kind, text, vector FROM embeddings LIMIT 1000", ())
+    sem_items = []
+    for _id, kind, text, vec_json in erows:
+        try:
+            v = pyjson.loads(vec_json)
+            sem = cosine(qv, v)
+            meta = {}
+            if kind == "transcript" and _id.startswith("T:"):
+                try:
+                    _, m, ts = _id.split(":", 2)
+                    meta = {"meeting_id": m, "timestamp": ts}
+                except Exception:
+                    pass
+            if kind == "document" and _id.startswith("D:"):
+                meta = {"file_id": _id[2:]}
+            if kind == "document" and _id.startswith("DPG:"):
+                try:
+                    _, fid, pidx, _c = _id.split(":", 3)
+                    meta = {"file_id": fid, "page_idx": int(pidx)}
+                except Exception:
+                    meta = {"file_id": _id}
+            sem_items.append((_id, kind, text, sem, meta))
+        except Exception:
+            continue
+
+    # Merge by id preference; if an id appears only in one list, missing score is 0
+    merged = {}
+    for kid, kind, text, s, meta in kw_items:
+        merged[kid] = {"id": kid, "kind": kind, "text": text, "kw": (s/max_kw), "sem": 0.0, **meta}
+    for _id, kind, text, sem, meta in sem_items:
+        e = merged.get(_id)
+        if e:
+            e["sem"] = sem
+        else:
+            merged[_id] = {"id": _id, "kind": kind, "text": text, "kw": 0.0, "sem": sem, **meta}
+
+    scored = []
+    for v in merged.values():
+        score = alpha * float(v["sem"]) + (1.0 - alpha) * float(v["kw"]) 
+        v["score"] = score
+        scored.append(v)
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    hits = scored[:k]
+    return {"query": query, "alpha": alpha, "k": k, "count": len(hits), "hits": hits}
 
 @app.get("/meetings/{meeting_id}/suggestions")
 async def get_suggestions(meeting_id: str):
@@ -1065,14 +1148,15 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
         # Update file status
         # Optional text extraction for search quality
         extracted_text = None
+        extracted_pages = None  # for PDFs
         try:
             fname = (file.filename or "").lower()
             if file.content_type == "application/pdf" or fname.endswith(".pdf"):
                 try:
                     import pypdf  # type: ignore
                     reader = pypdf.PdfReader(io.BytesIO(content))
-                    pages = [page.extract_text() or "" for page in reader.pages]
-                    extracted_text = "\n".join(pages)
+                    extracted_pages = [page.extract_text() or "" for page in reader.pages]
+                    extracted_text = "\n".join(extracted_pages)
                 except Exception:
                     extracted_text = None
             elif file.content_type in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",) or fname.endswith(".docx"):
@@ -1123,18 +1207,36 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
         # upsert embeddings for full document text in chunks if available
         try:
             if extracted_text:
-                chunk_size = 1000
-                max_chars = 8000
-                text = extracted_text[:max_chars]
-                for idx in range(0, len(text), chunk_size):
-                    chunk = text[idx: idx+chunk_size]
-                    if not chunk.strip():
-                        continue
-                    emb_full = compute_embedding(chunk)
-                    await adb_execute(
-                        "INSERT OR REPLACE INTO embeddings (id, kind, text, vector) VALUES (?,?,?,?)",
-                        (f"DTXT:{file_id}:{idx//chunk_size}", "document", chunk, pyjson.dumps(emb_full))
-                    )
+                # If we have page-level text (PDF), embed per page; otherwise chunk by text length
+                if extracted_pages:
+                    for p_idx, p_txt in enumerate(extracted_pages):
+                        txt = (p_txt or "").strip()
+                        if not txt:
+                            continue
+                        # further chunk long pages ~1000 chars
+                        chunk_size = 1000
+                        for c_idx in range(0, len(txt), chunk_size):
+                            chunk = txt[c_idx:c_idx+chunk_size]
+                            if not chunk.strip():
+                                continue
+                            emb_page = compute_embedding(chunk)
+                            await adb_execute(
+                                "INSERT OR REPLACE INTO embeddings (id, kind, text, vector) VALUES (?,?,?,?)",
+                                (f"DPG:{file_id}:{p_idx}:{c_idx//chunk_size}", "document", chunk, pyjson.dumps(emb_page))
+                            )
+                else:
+                    chunk_size = 1000
+                    max_chars = 8000
+                    text = extracted_text[:max_chars]
+                    for idx in range(0, len(text), chunk_size):
+                        chunk = text[idx: idx+chunk_size]
+                        if not chunk.strip():
+                            continue
+                        emb_full = compute_embedding(chunk)
+                        await adb_execute(
+                            "INSERT OR REPLACE INTO embeddings (id, kind, text, vector) VALUES (?,?,?,?)",
+                            (f"DTXT:{file_id}:{idx//chunk_size}", "document", chunk, pyjson.dumps(emb_full))
+                        )
         except Exception:
             pass
         
@@ -2383,7 +2485,8 @@ async def get_demo():
                             return;
                         }
                         const items = data.hits.map(h => {
-                            const meta = h.kind === 'transcript' ? `Transcript • ${h.timestamp||''}` : `Document • ${h.file_id||''}`;
+                            const page = (typeof h.page_idx === 'number') ? ` • p. ${h.page_idx+1}` : '';
+                            const meta = h.kind === 'transcript' ? `Transcript • ${h.timestamp||''}` : `Document • ${h.file_id||''}${page}`;
                             return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\">\n`
                                 + `  <div class=\"text-xs text-gray-500 mb-1\">${meta} • score ${Number(h.score||0).toFixed(3)}</div>\n`
                                 + `  <div class=\"text-sm text-gray-200\">${escapeHtml(h.text||'')}</div>\n`
