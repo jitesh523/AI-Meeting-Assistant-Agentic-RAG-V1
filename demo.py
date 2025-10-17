@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -1284,6 +1285,16 @@ async def get_uploaded_files(meeting_id: str):
     """Get all uploaded files for a meeting"""
     meeting_files = [f for f in uploaded_files.values() if f.status == "ready"]
     return {"meeting_id": meeting_id, "files": [f.model_dump() for f in meeting_files]}
+
+@app.get("/files/raw/{file_id}")
+async def get_raw_file(file_id: str):
+    if file_id not in uploaded_files:
+        raise HTTPException(status_code=404, detail="File not found")
+    f = uploaded_files[file_id]
+    file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{f.filename}")
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+    return FileResponse(file_path, filename=f.filename)
 
 @app.post("/files/{file_id}/action")
 async def perform_file_action(file_id: str, action: FileAction):

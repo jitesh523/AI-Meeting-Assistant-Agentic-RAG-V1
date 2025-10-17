@@ -18,7 +18,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install fastapi uvicorn pytest aiosqlite httpx groq pydantic
           # Optional heavy deps; ignore failures
-          pip install sentence-transformers pypdf python-docx || true
+          pip install sentence-transformers pypdf python-docx reportlab || true
       - name: Run tests
         env:
           GROQ_API_KEY: ""
