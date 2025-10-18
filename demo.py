@@ -18,12 +18,14 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, F
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from groq import Groq
 import tempfile
 import io
 import json as pyjson
 import math
+from functools import lru_cache
 try:
     import aiosqlite
     AIOSQLITE_AVAILABLE = True
@@ -63,6 +65,11 @@ logger = logging.getLogger(__name__)
 
 # Create FastAPI app
 app = FastAPI(title="AI Meeting Assistant", version="1.0.0")
+os.makedirs("static", exist_ok=True)
+try:
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+except Exception:
+    pass
 
 # CORS middleware
 app.add_middleware(
@@ -271,6 +278,13 @@ def init_db():
     except Exception as e:
         logger.warning(f"DB init failed: {e}")
 
+    # Best-effort indexes (ignore failures if SQLite lacks FTS or schema differs)
+    try:
+        db_execute("CREATE INDEX IF NOT EXISTS idx_embeddings_file ON embeddings(file_id)")
+        db_execute("CREATE INDEX IF NOT EXISTS idx_embeddings_page ON embeddings(page_idx)")
+    except Exception:
+        pass
+
 def db_execute(query: str, params: tuple = ()):  # best-effort write
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -435,6 +449,7 @@ Respond with a concise suggestion (max 150 words) that would be helpful for this
                     "confidence": 0.85,
                     "reasons": ["AI analysis", "Contextual understanding"]
                 }
+
                 logger.info("Successfully generated Groq AI suggestion")
             except Exception as groq_error:
                 logger.warning(f"Groq API error during processing: {groq_error}")
@@ -759,10 +774,19 @@ async def search(query: str, meeting_id: Optional[str] = None, k: int = 10):
     return result
 
 # Semantic search using embeddings
+_SEM_CACHE: Dict[tuple, tuple] = {}
+_SEM_TTL_SEC = 30
+
 @app.get("/semantic_search")
-async def semantic_search(query: str, page: int = 1, per_page: int = 10):
+async def semantic_search(query: str, page: int = 1, per_page: int = 10, rerank: bool = False):
     METRICS["semantic_search_requests_total"] += 1
-    qv = compute_embedding(query)
+    # cache check
+    key = (query, int(page), int(per_page), bool(rerank))
+    now_ts = time.time()
+    cached = _SEM_CACHE.get(key)
+    if cached and (now_ts - cached[0] < _SEM_TTL_SEC):
+        return cached[1]
+    qv = compute_embedding_cached(query)
     # Pull candidates (limit for demo)
     rows = await adb_query_all("SELECT id, kind, text, vector FROM embeddings LIMIT 1000", ())
     scored = []
@@ -780,6 +804,15 @@ async def semantic_search(query: str, page: int = 1, per_page: int = 10):
     start = (page - 1) * max(1, per_page)
     end = start + max(1, per_page)
     slice_items = scored[start:end]
+    # Optional rerank blending in keyword overlap if requested
+    if rerank:
+        qtokens = [t for t in (query or "").lower().split() if t]
+        def rr_score(item):
+            _id, _k, text, base = item
+            low = (text or "").lower()
+            kw = sum(low.count(t) for t in qtokens)
+            return 0.8*float(base) + 0.2*(kw/ max(1, len(qtokens)))
+        slice_items = sorted(slice_items, key=rr_score, reverse=True)
     hits = []
     for _id, kind, text, score in slice_items:
         entry = {"id": _id, "kind": kind, "text": text, "score": score}
@@ -800,7 +833,9 @@ async def semantic_search(query: str, page: int = 1, per_page: int = 10):
             except Exception:
                 pass
         hits.append(entry)
-    return {"query": query, "page": page, "per_page": per_page, "total": total, "count": len(hits), "hits": hits}
+    result_obj = {"query": query, "page": page, "per_page": per_page, "total": total, "count": len(hits), "hits": hits}
+    _SEM_CACHE[key] = (now_ts, result_obj)
+    return result_obj
 
 # Hybrid search combining keyword (FTS) and semantic (embeddings)
 @app.get("/hybrid_search")
@@ -883,10 +918,11 @@ async def ask(payload: dict):
     meeting_id = payload.get("meeting_id")
     k = int(payload.get("k", 6))
     alpha = float(payload.get("alpha", 0.6))
+    rerank = bool(payload.get("rerank", False))
     if not q:
         raise HTTPException(status_code=400, detail="query required")
     # gather candidates
-    sem = await semantic_search(q, page=1, per_page=k)
+    sem = await semantic_search(q, page=1, per_page=k, rerank=rerank)
     hyb = await hybrid_search(q, meeting_id=meeting_id, alpha=alpha, k=k)
     # dedupe, prefer hybrid order
     seen = set()
@@ -1093,6 +1129,18 @@ def compute_embedding(text: str) -> List[float]:
         logger.debug(f"ST embedding failed: {e}")
     return hash_embed(text)
 
+# Embedding cache (LRU)
+@lru_cache(maxsize=2048)
+def _embed_tuple(text: str) -> tuple:
+    try:
+        v = compute_embedding(text)
+        return tuple(float(x) for x in v)
+    except Exception:
+        return tuple(hash_embed(text))
+
+def compute_embedding_cached(text: str) -> List[float]:
+    return list(_embed_tuple(text))
+
 def cosine(a: List[float], b: List[float]) -> float:
     s = 0.0
     for i in range(min(len(a), len(b))):
@@ -1264,33 +1312,58 @@ async def upload_file(file: UploadFile = File(...), meeting_id: str = Form(...))
             if extracted_text:
                 # If we have page-level text (PDF), embed per page; otherwise chunk by text length
                 if extracted_pages:
+                    import re
                     for p_idx, p_txt in enumerate(extracted_pages):
                         txt = (p_txt or "").strip()
                         if not txt:
                             continue
-                        # further chunk long pages ~1000 chars
-                        chunk_size = 1000
-                        for c_idx in range(0, len(txt), chunk_size):
-                            chunk = txt[c_idx:c_idx+chunk_size]
+                        # sentence-aware chunks per page
+                        sents = [s.strip() for s in re.split(r"(?<=[\.!?])\s+", txt) if s.strip()]
+                        chunks = []
+                        buf, wc = [], 0
+                        for sent in sents:
+                            w = len(sent.split())
+                            if wc + w > 250 and buf:
+                                chunks.append(" ".join(buf))
+                                last_words = " ".join(" ".join(buf).split()[-50:])
+                                buf, wc = ([last_words] if last_words else []), len(last_words.split())
+                            buf.append(sent); wc += w
+                        if buf:
+                            chunks.append(" ".join(buf))
+                        for c_idx, chunk in enumerate(chunks):
                             if not chunk.strip():
                                 continue
-                            emb_page = compute_embedding(chunk)
+                            emb_page = compute_embedding_cached(chunk)
                             await adb_execute(
                                 "INSERT OR REPLACE INTO embeddings (id, kind, text, vector, file_id, page_idx, chunk_idx) VALUES (?,?,?,?,?,?,?)",
-                                (f"DPG:{file_id}:{p_idx}:{c_idx//chunk_size}", "document", chunk, pyjson.dumps(emb_page), file_id, p_idx, c_idx//chunk_size)
+                                (f"DPG:{file_id}:{p_idx}:{c_idx}", "document", chunk, pyjson.dumps(emb_page), file_id, p_idx, c_idx)
                             )
                 else:
-                    chunk_size = 1000
-                    max_chars = 8000
-                    text = extracted_text[:max_chars]
-                    for idx in range(0, len(text), chunk_size):
-                        chunk = text[idx: idx+chunk_size]
+                    # Sentence-aware chunking with simple overlap
+                    text = (extracted_text or "")[:20000]  # cap for speed
+                    # naive sentence split
+                    import re
+                    sents = [s.strip() for s in re.split(r"(?<=[\.!?])\s+", text) if s.strip()]
+                    # group into ~250-word chunks with ~50-word overlap
+                    chunks = []
+                    buf, wc = [], 0
+                    for sent in sents:
+                        w = len(sent.split())
+                        if wc + w > 250 and buf:
+                            chunks.append(" ".join(buf))
+                            # create overlap
+                            last_words = " ".join(" ".join(buf).split()[-50:])
+                            buf, wc = ([last_words] if last_words else []), len(last_words.split())
+                        buf.append(sent); wc += w
+                    if buf:
+                        chunks.append(" ".join(buf))
+                    for c_idx, chunk in enumerate(chunks):
                         if not chunk.strip():
                             continue
-                        emb_full = compute_embedding(chunk)
+                        emb_full = compute_embedding_cached(chunk)
                         await adb_execute(
                             "INSERT OR REPLACE INTO embeddings (id, kind, text, vector, file_id, chunk_idx) VALUES (?,?,?,?,?,?)",
-                            (f"DTXT:{file_id}:{idx//chunk_size}", "document", chunk, pyjson.dumps(emb_full), file_id, idx//chunk_size)
+                            (f"DTXT:{file_id}:{c_idx}", "document", chunk, pyjson.dumps(emb_full), file_id, c_idx)
                         )
         except Exception:
             pass
@@ -1872,7 +1945,7 @@ async def get_demo():
                             <!-- Files will be added here dynamically -->
                         </div>
 
-                        <!-- Search Controls -->
+                        <!-- Search & Ask Controls -->
                         <div class="space-y-2">
                             <h4 class="text-sm font-medium text-gray-300">Search Documents & Transcript</h4>
                             <div class="flex gap-2 items-center">
@@ -1882,6 +1955,20 @@ async def get_demo():
                                     <button class="ai-button-secondary px-2" onclick="semanticPrev()">Prev</button>
                                     <span id="semanticPageLabel" class="text-gray-400">Page 1</span>
                                     <button class="ai-button-secondary px-2" onclick="semanticNext()">Next</button>
+                                </div>
+                            </div>
+                            <div class="flex gap-2 items-center">
+                                <input type="text" id="askInput" class="ai-input flex-1" placeholder="Ask a question across transcript and docs...">
+                                <button class="ai-button-secondary px-4" onclick="performAsk()">Ask</button>
+                                <div class="flex items-center gap-2 text-xs">
+                                    <label for="hybridAlpha" class="text-gray-400">alpha</label>
+                                    <input id="hybridAlpha" type="range" min="0" max="1" step="0.1" value="0.6" class="w-32" oninput="document.getElementById('hybridAlphaVal').textContent=this.value; performHybridSearch()">
+                                    <span id="hybridAlphaVal" class="text-gray-400">0.6</span>
+                                </div>
+                                <div id="hybridPager" class="flex items-center gap-2 text-xs">
+                                    <button class="ai-button-secondary px-2" onclick="hybridPrev()">Prev</button>
+                                    <span id="hybridPageLabel" class="text-gray-400">Page 1</span>
+                                    <button class="ai-button-secondary px-2" onclick="hybridNext()">Next</button>
                                 </div>
                             </div>
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-3" id="searchPanels">
@@ -1895,6 +1982,17 @@ async def get_demo():
                                         <div class="text-xs text-gray-500" id="semanticTotal"></div>
                                     </div>
                                     <div id="searchResultsSemantic" class="space-y-2 text-sm text-gray-200"></div>
+                                </div>
+                                <div class="p-3 rounded bg-gray-800/40 border border-gray-700 md:col-span-2">
+                                    <div class="flex items-center justify-between mb-2">
+                                        <div class="text-sm text-gray-300">Hybrid Results</div>
+                                        <div class="text-xs text-gray-500" id="hybridTotal"></div>
+                                    </div>
+                                    <div id="searchResultsHybrid" class="space-y-2 text-sm text-gray-200"></div>
+                                </div>
+                                <div class="p-3 rounded bg-gray-800/40 border border-gray-700 md:col-span-2">
+                                    <div class="text-sm text-gray-300 mb-2">Ask Answer</div>
+                                    <div id="askAnswer" class="text-sm text-gray-200"></div>
                                 </div>
                             </div>
                         </div>
@@ -2709,6 +2807,23 @@ async def get_demo():
                         summaryContent.innerHTML = '<div class="text-sm text-red-400">Failed to generate summary.</div>';
                         summarySection.style.display = 'block';
                     });
+            }
+            function scrollToCitation(id){
+                const lists = ['searchResultsKeyword','searchResultsSemantic','searchResultsHybrid'];
+                for (const lid of lists){
+                    const root = document.getElementById(lid);
+                    if (!root) continue;
+                    // naive match: find first child containing the id string
+                    const el = Array.from(root.children).find(d => (d.textContent||'').includes(id));
+                    if (el){
+                        el.scrollIntoView({behavior:'smooth', block:'center'});
+                        try {
+                            el.classList.add('ring-2','ring-blue-400','animate-pulse');
+                            setTimeout(()=>{ el.classList.remove('ring-2','ring-blue-400','animate-pulse'); }, 1200);
+                        } catch(_){}
+                        break;
+                    }
+                }
             }
         </script>
     </body>
