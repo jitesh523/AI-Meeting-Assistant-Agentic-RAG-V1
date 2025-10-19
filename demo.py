@@ -27,6 +27,11 @@ import json as pyjson
 import math
 from functools import lru_cache
 try:
+    import faiss  # optional ANN
+    FAISS_AVAILABLE = True
+except Exception:
+    FAISS_AVAILABLE = False
+try:
     import aiosqlite
     AIOSQLITE_AVAILABLE = True
 except Exception:
@@ -377,6 +382,40 @@ active_connections = {}
 init_db()
 audio_buffers: Dict[str, bytearray] = {}
 audio_last_flush: Dict[str, float] = {}
+
+# Build ANN index best-effort
+ANN_INDEX = None
+ANN_IDS: List[str] = []
+ANN_DIM = 0
+def build_ann_index(max_rows: int = 5000):
+    global ANN_INDEX, ANN_IDS, ANN_DIM
+    if not FAISS_AVAILABLE:
+        return
+    try:
+        rows = db_query_all("SELECT id, vector FROM embeddings LIMIT ?", (max_rows,))
+        vecs = []
+        ids = []
+        for _id, vjson in rows:
+            try:
+                v = pyjson.loads(vjson)
+                if not ANN_DIM:
+                    ANN_DIM = len(v)
+                vecs.append(v)
+                ids.append(_id)
+            except Exception:
+                continue
+        if vecs and ANN_DIM:
+            import numpy as np
+            xb = np.array(vecs, dtype='float32')
+            index = faiss.IndexFlatIP(ANN_DIM)
+            index.add(xb)
+            ANN_INDEX = index
+            ANN_IDS = ids
+            logger.info(f"ANN index built with {len(ANN_IDS)} vectors (dim={ANN_DIM})")
+    except Exception as e:
+        logger.debug(f"ANN build skipped: {e}")
+
+build_ann_index()
 
 # Simulated AI responses
 AI_RESPONSES = [
@@ -779,16 +818,33 @@ _SEM_TTL_SEC = 30
 
 @app.get("/semantic_search")
 async def semantic_search(query: str, page: int = 1, per_page: int = 10, rerank: bool = False):
-    METRICS["semantic_search_requests_total"] += 1
+    t0 = time.time(); METRICS["semantic_search_requests_total"] += 1
     # cache check
     key = (query, int(page), int(per_page), bool(rerank))
     now_ts = time.time()
     cached = _SEM_CACHE.get(key)
     if cached and (now_ts - cached[0] < _SEM_TTL_SEC):
+        METRICS["semantic_cache_hits_total"] = METRICS.get("semantic_cache_hits_total", 0) + 1
         return cached[1]
     qv = compute_embedding_cached(query)
     # Pull candidates (limit for demo)
-    rows = await adb_query_all("SELECT id, kind, text, vector FROM embeddings LIMIT 1000", ())
+    rows = []
+    if FAISS_AVAILABLE and ANN_INDEX is not None and ANN_DIM:
+        try:
+            import numpy as np
+            q = np.array([qv], dtype='float32')
+            k = min(500, len(ANN_IDS))
+            D, I = ANN_INDEX.search(q, k)
+            ids_set = set(ANN_IDS[i] for i in I[0] if i >= 0)
+            if ids_set:
+                placeholders = ",".join(["?"]*len(ids_set))
+                sql = f"SELECT id, kind, text, vector FROM embeddings WHERE id IN ({placeholders})"
+                rows = await adb_query_all(sql, tuple(ids_set))
+        except Exception as e:
+            logger.debug(f"ANN search skipped: {e}")
+            rows = await adb_query_all("SELECT id, kind, text, vector FROM embeddings LIMIT 1000", ())
+    else:
+        rows = await adb_query_all("SELECT id, kind, text, vector FROM embeddings LIMIT 1000", ())
     scored = []
     for _id, kind, text, vec_json in rows:
         try:
@@ -835,6 +891,10 @@ async def semantic_search(query: str, page: int = 1, per_page: int = 10, rerank:
         hits.append(entry)
     result_obj = {"query": query, "page": page, "per_page": per_page, "total": total, "count": len(hits), "hits": hits}
     _SEM_CACHE[key] = (now_ts, result_obj)
+    # latency metric
+    dur_ms = int((time.time() - t0)*1000)
+    METRICS["semantic_search_latency_ms_sum"] = METRICS.get("semantic_search_latency_ms_sum", 0) + dur_ms
+    METRICS["semantic_search_latency_ms_count"] = METRICS.get("semantic_search_latency_ms_count", 0) + 1
     return result_obj
 
 # Hybrid search combining keyword (FTS) and semantic (embeddings)
@@ -914,7 +974,7 @@ async def hybrid_search(query: str, meeting_id: Optional[str] = None, alpha: flo
 
 @app.post("/ask")
 async def ask(payload: dict):
-    q = (payload.get("query") or "").strip()
+    t0 = time.time(); q = (payload.get("query") or "").strip()
     meeting_id = payload.get("meeting_id")
     k = int(payload.get("k", 6))
     alpha = float(payload.get("alpha", 0.6))
@@ -965,7 +1025,11 @@ async def ask(payload: dict):
             logger.debug(f"/ask groq error: {e}")
     if not answer:
         answer = "Based on the provided context: " + (cands[0].get("text","")[:200] if cands else "No context available.")
-    return {"query": q, "answer": answer, "citations": citations}
+    result = {"query": q, "answer": answer, "citations": citations}
+    dur_ms = int((time.time() - t0)*1000)
+    METRICS["ask_latency_ms_sum"] = METRICS.get("ask_latency_ms_sum", 0) + dur_ms
+    METRICS["ask_latency_ms_count"] = METRICS.get("ask_latency_ms_count", 0) + 1
+    return result
 
 @app.get("/meetings/{meeting_id}/suggestions")
 async def get_suggestions(meeting_id: str):
@@ -1945,7 +2009,7 @@ async def get_demo():
                             <!-- Files will be added here dynamically -->
                         </div>
 
-                        <!-- Search & Ask Controls -->
+                        <!-- Search, Ask & Filters -->
                         <div class="space-y-2">
                             <h4 class="text-sm font-medium text-gray-300">Search Documents & Transcript</h4>
                             <div class="flex gap-2 items-center">
@@ -1956,6 +2020,32 @@ async def get_demo():
                                     <span id="semanticPageLabel" class="text-gray-400">Page 1</span>
                                     <button class="ai-button-secondary px-2" onclick="semanticNext()">Next</button>
                                 </div>
+                            </div>
+                            <!-- Filters Bar -->
+                            <div class="flex flex-wrap gap-2 items-center text-xs">
+                                <div class="flex items-center gap-1">
+                                    <label class="text-gray-400">Source</label>
+                                    <select id="fltSource" class="ai-input px-2 py-1" style="height:32px;width:140px" onchange="applyFilters()">
+                                        <option value="">All</option>
+                                        <option value="transcript">Transcript</option>
+                                        <option value="document">Document</option>
+                                    </select>
+                                </div>
+                                <div class="flex items-center gap-1">
+                                    <label class="text-gray-400">File</label>
+                                    <input id="fltFile" class="ai-input px-2 py-1" placeholder="file_id" style="height:32px;width:180px" oninput="applyFilters()" />
+                                </div>
+                                <div class="flex items-center gap-1">
+                                    <label class="text-gray-400">Page</label>
+                                    <input id="fltPageMin" type="number" class="ai-input px-2 py-1" placeholder="min" style="height:32px;width:80px" oninput="applyFilters()" />
+                                    <span class="text-gray-500">-</span>
+                                    <input id="fltPageMax" type="number" class="ai-input px-2 py-1" placeholder="max" style="height:32px;width:80px" oninput="applyFilters()" />
+                                </div>
+                                <div class="flex items-center gap-1">
+                                    <label class="text-gray-400">Speaker</label>
+                                    <input id="fltSpeaker" class="ai-input px-2 py-1" placeholder="name" style="height:32px;width:160px" oninput="applyFilters()" />
+                                </div>
+                                <button class="ai-button-secondary px-3" onclick="clearFilters()">Clear</button>
                             </div>
                             <div class="flex gap-2 items-center">
                                 <input type="text" id="askInput" class="ai-input flex-1" placeholder="Ask a question across transcript and docs...">
@@ -2621,25 +2711,30 @@ async def get_demo():
                         const hi = (t)=> (t||'').replace(new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'ig'), m=>`<mark class="bg-yellow-600/40 px-1 rounded">${m}</mark>`);
                         const items = data.hits.map(h => {
                             if (h.source === 'transcript') {
-                                return `<div class="p-3 rounded bg-gray-800/60 border border-gray-700">
-                                    <div class="text-xs text-gray-500 mb-1">Transcript • ${new Date(h.timestamp).toLocaleTimeString()}</div>
-                                    <div class="text-sm text-gray-200"><strong>${escapeHtml(h.speaker)}:</strong> ${hi(escapeHtml(h.text))}</div>
-                                </div>`;
+                                const dsrc = 'transcript';
+                                const dfile = '';
+                                const dpage = '';
+                                const dspeaker = h.speaker || '';
+                                return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\" data-source=\"${dsrc}\" data-file=\"${dfile}\" data-page=\"${dpage}\" data-speaker=\"${escapeHtml(dspeaker)}\">\n`
+                                    + `  <div class=\"text-xs text-gray-500 mb-1\">Transcript • ${new Date(h.timestamp).toLocaleTimeString()}</div>\n`
+                                    + `  <div class=\"text-sm text-gray-200\"><strong>${escapeHtml(h.speaker)}:</strong> ${hi(escapeHtml(h.text))}</div>\n`
+                                    + `</div>`;
                             } else {
-                                return `<div class="p-3 rounded bg-gray-800/60 border border-gray-700">
-                                    <div class="text-xs text-gray-500 mb-1">Document • ${escapeHtml(h.filename || '')}</div>
-                                    <div class="text-sm text-gray-200">${hi(escapeHtml(h.snippet || ''))}</div>
-                                </div>`;
+                                const dsrc = 'document';
+                                const dfile = h.file_id || '';
+                                const dpage = '';
+                                const dspeaker = '';
+                                return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\" data-source=\"${dsrc}\" data-file=\"${dfile}\" data-page=\"${dpage}\" data-speaker=\"${escapeHtml(dspeaker)}\">\n`
+                                    + `  <div class=\"text-xs text-gray-500 mb-1\">Document • ${escapeHtml(h.filename || '')}</div>\n`
+                                    + `  <div class=\"text-sm text-gray-200\">${hi(escapeHtml(h.snippet || ''))}</div>\n`
+                                    + `</div>`;
                             }
                         }).join('');
                         // Filters UI
                         const filters = `<div class="flex gap-2 mb-2 text-xs"><button id="filterAll" class="px-2 py-1 rounded bg-gray-700">All</button><button id="filterTranscript" class="px-2 py-1 rounded bg-gray-700">Transcript</button><button id="filterDocs" class="px-2 py-1 rounded bg-gray-700">Docs</button></div>`;
-                        results.innerHTML = `${answerHtml}<div class="text-sm text-gray-400 mb-2">${data.count} results</div>${filters}<div id="searchList">${items}</div>`;
+                        results.innerHTML = `${answerHtml}<div class=\"text-sm text-gray-400 mb-2\">${data.count} results</div>${filters}<div id=\"searchList\">${items}</div>`;
                         // Filter behavior
-                        const listEl = document.getElementById('searchList');
-                        document.getElementById('filterAll').onclick = ()=>{ Array.from(listEl.children).forEach(c=>c.style.display='block'); };
-                        document.getElementById('filterTranscript').onclick = ()=>{ Array.from(listEl.children).forEach(c=>{ c.querySelector('.text-xs')?.textContent.includes('Transcript') ? c.style.display='block' : c.style.display='none'; }); };
-                        document.getElementById('filterDocs').onclick = ()=>{ Array.from(listEl.children).forEach(c=>{ c.querySelector('.text-xs')?.textContent.includes('Document') ? c.style.display='block' : c.style.display='none'; }); };
+                        applyFilters();
                     })
                     .catch(e => {
                         console.error('Search error', e);
@@ -2667,7 +2762,11 @@ async def get_demo():
                         const items = data.hits.map(h => {
                             const page = (typeof h.page_idx === 'number') ? ` • p. ${h.page_idx+1}` : '';
                             const meta = h.kind === 'transcript' ? `Transcript • ${h.timestamp||''}` : `Document • ${h.file_id||''}${page}`;
-                            return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\">\n`
+                            const dsrc = h.kind;
+                            const dfile = h.file_id || '';
+                            const dpage = (typeof h.page_idx === 'number') ? (h.page_idx+1) : '';
+                            const dspeaker = h.speaker || '';
+                            return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\" data-source=\"${dsrc}\" data-file=\"${dfile}\" data-page=\"${dpage}\" data-speaker=\"${escapeHtml(dspeaker)}\">\n`
                                 + `  <div class=\"text-xs text-gray-500 mb-1\">${meta} • score ${Number(h.score||0).toFixed(3)}</div>\n`
                                 + `  <div class=\"text-sm text-gray-200\">${escapeHtml(h.text||'')}</div>\n`
                                 + `</div>`;
@@ -2683,10 +2782,72 @@ async def get_demo():
                     });
             }
 
+            let hybridPage = 1;
+            function hybridPrev(){ if (hybridPage>1){ hybridPage--; performHybridSearch(); } }
+            function hybridNext(){ hybridPage++; performHybridSearch(); }
+
+            function performHybridSearch() {
+                const query = document.getElementById('searchInput').value.trim();
+                if (!query) return;
+                const results = document.getElementById('searchResultsHybrid');
+                const totalEl = document.getElementById('hybridTotal');
+                results.innerHTML = '<div class="text-sm text-gray-400">Hybrid searching…</div>';
+                fetch(`/hybrid_search?query=${encodeURIComponent(query)}&page=${hybridPage}&per_page=10`)
+                    .then(r => r.json())
+                    .then(data => {
+                        if (!data.hits || data.hits.length === 0) {
+                            results.innerHTML = '<div class="text-sm text-gray-400">No hybrid matches.</div>';
+                            return;
+                        }
+                        const items = data.hits.map(h => {
+                            const page = (typeof h.page_idx === 'number') ? ` • p. ${h.page_idx+1}` : '';
+                            const meta = h.kind === 'transcript' ? `Transcript • ${h.timestamp||''}` : `Document • ${h.file_id||''}${page}`;
+                            const openBtn = (h.file_id && (typeof h.page_idx === 'number')) ? `<a target=\"_blank\" href=\"/files/view/${h.file_id}#page=${h.page_idx+1}\" class=\"ml-2 text-xs text-blue-400 underline\">Open</a>` : '';
+                            const dsrc = h.kind;
+                            const dfile = h.file_id || '';
+                            const dpage = (typeof h.page_idx === 'number') ? (h.page_idx+1) : '';
+                            const dspeaker = h.speaker || '';
+                            return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\" data-source=\"${dsrc}\" data-file=\"${dfile}\" data-page=\"${dpage}\" data-speaker=\"${escapeHtml(dspeaker)}\">\n`
+                                   + `  <div class=\"text-xs text-gray-500 mb-1\">${meta} • score ${Number(h.score||0).toFixed(3)} ${openBtn}</div>\n`
+                                   + `  <div class=\"text-sm text-gray-200\">${escapeHtml(h.text||'')}</div>\n`
+                                   + `</div>`;
+                        }).join('');
+                        totalEl.textContent = `${data.count||data.hits.length} results`;
+                        document.getElementById('hybridPageLabel').textContent = `Page ${hybridPage}`;
+                        results.innerHTML = items;
+                        applyFilters();
+                    })
+                    .catch(e => { console.error('Hybrid search error', e); results.innerHTML = '<div class=\"text-sm text-red-400\">Hybrid search failed.</div>'; });
+            }
+
+            function applyFilters(){
+                const src = (document.getElementById('fltSource').value||'').toLowerCase();
+                const fid = (document.getElementById('fltFile').value||'').trim();
+                const pmin = parseInt(document.getElementById('fltPageMin').value||'');
+                const pmax = parseInt(document.getElementById('fltPageMax').value||'');
+                const spk = (document.getElementById('fltSpeaker').value||'').toLowerCase();
+                const lists = ['searchResultsKeyword','searchResultsSemantic','searchResultsHybrid'];
+                for (const lid of lists){
+                    const root = document.getElementById(lid); if(!root) continue;
+                    Array.from(root.children).forEach(el=>{
+                        let ok = true;
+                        const esrc = (el.getAttribute('data-source')||'').toLowerCase();
+                        const efile = el.getAttribute('data-file')||'';
+                        const epage = parseInt(el.getAttribute('data-page')||'');
+                        const espk = (el.getAttribute('data-speaker')||'').toLowerCase();
+                        if (src && esrc !== src) ok = false;
+                        if (fid && efile && !efile.includes(fid)) ok = false;
+                        if (!isNaN(pmin) && !isNaN(epage) && epage < pmin) ok = false;
+                        if (!isNaN(pmax) && !isNaN(epage) && epage > pmax) ok = false;
+                        if (spk && (!espk || !espk.includes(spk))) ok = false;
+                        el.style.display = ok ? 'block' : 'none';
+                    });
+                }
+            }
+
             // Basic HTML escaper
             function escapeHtml(s){ return (s||'').replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]||c)); }
 
-            // Drag and drop functionality
             const uploadArea = document.getElementById('fileUploadArea');
             
             uploadArea.addEventListener('dragover', (e) => {
