@@ -85,6 +85,80 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Auth and Rate Limiting ---
+API_KEY = os.getenv("API_KEY", "")
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+RATE_LIMIT_CAPACITY = int(os.getenv("RATE_LIMIT_CAPACITY", "60"))  # tokens
+RATE_LIMIT_REFILL_PER_SEC = float(os.getenv("RATE_LIMIT_REFILL_PER_SEC", "1.0"))  # tokens/sec
+
+_rl_buckets: Dict[str, Dict[str, float]] = {}
+
+def _rate_limit_key(request: "Request") -> str:
+    try:
+        ip = request.client.host if request.client else "unknown"
+    except Exception:
+        ip = "unknown"
+    key = request.headers.get("x-api-key") or request.headers.get("authorization") or ip
+    return f"{ip}:{key}"
+
+def _rate_limit_consume(key: str, cost: float = 1.0) -> bool:
+    now = time.time()
+    b = _rl_buckets.get(key)
+    if not b:
+        _rl_buckets[key] = {"tokens": RATE_LIMIT_CAPACITY - cost, "ts": now}
+        return True
+    # refill
+    elapsed = max(0.0, now - b["ts"])
+    b["tokens"] = min(RATE_LIMIT_CAPACITY, b["tokens"] + elapsed * RATE_LIMIT_REFILL_PER_SEC)
+    b["ts"] = now
+    if b["tokens"] >= cost:
+        b["tokens"] -= cost
+        return True
+    return False
+
+def _verify_api_key_or_jwt(request: "Request") -> bool:
+    key = request.headers.get("x-api-key", "").strip()
+    if API_KEY and key == API_KEY:
+        return True
+    auth = request.headers.get("authorization", "").strip()
+    if auth.lower().startswith("bearer ") and JWT_SECRET:
+        token = auth.split(" ", 1)[1]
+        try:
+            import jwt as pyjwt
+            pyjwt.decode(token, JWT_SECRET, algorithms=["HS256", "HS384", "HS512"])
+            return True
+        except Exception:
+            return False
+    # if no secrets configured, allow
+    if not API_KEY and not JWT_SECRET:
+        return True
+    return False
+
+from fastapi import Request
+@app.middleware("http")
+async def auth_and_rate_limit_middleware(request: Request, call_next):
+    path = request.url.path or "/"
+    protected = path.startswith("/upload") or path.startswith("/files/") or path.startswith("/meetings/") or path == "/ask"
+    if protected:
+        if not _verify_api_key_or_jwt(request):
+            METRICS["auth_denied_total"] = METRICS.get("auth_denied_total", 0) + 1
+            return HTMLResponse(status_code=401, content="Unauthorized")
+        # rate limit per key/ip
+        key = _rate_limit_key(request)
+        if not _rate_limit_consume(key):
+            METRICS["rate_limited_total"] = METRICS.get("rate_limited_total", 0) + 1
+            resp = HTMLResponse(status_code=429, content="Too Many Requests")
+            # Approximate wait
+            resp.headers["Retry-After"] = "1"
+            return resp
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        METRICS["http_errors_total"] = METRICS.get("http_errors_total", 0) + 1
+        logger.error(f"Request failed: {e}")
+        raise
+
 # --- Simple API key auth + naive rate limiting ---
 DEMO_API_KEY = os.getenv("DEMO_API_KEY")  # if set, require X-API-Key header
 RATE_LIMIT_RPM = int(os.getenv("DEMO_RATE_LIMIT_RPM", "120"))
@@ -553,6 +627,28 @@ Respond with a concise suggestion (max 150 words) that would be helpful for this
 # WebSocket endpoint
 @app.websocket("/ws/audio/{meeting_id}")
 async def websocket_endpoint(websocket: WebSocket, meeting_id: str):
+    # WebSocket auth (optional when secrets configured)
+    try:
+        api_key = websocket.headers.get("x-api-key", "")
+        auth = websocket.headers.get("authorization", "")
+        allow = True
+        if API_KEY or JWT_SECRET:
+            allow = False
+            if API_KEY and api_key == API_KEY:
+                allow = True
+            elif auth.lower().startswith("bearer ") and JWT_SECRET:
+                try:
+                    import jwt as pyjwt
+                    token = auth.split(" ", 1)[1]
+                    pyjwt.decode(token, JWT_SECRET, algorithms=["HS256","HS384","HS512"])
+                    allow = True
+                except Exception:
+                    allow = False
+        if not allow:
+            await websocket.close(code=4401)
+            return
+    except Exception:
+        pass
     await manager.connect(websocket, meeting_id)
     
     try:
