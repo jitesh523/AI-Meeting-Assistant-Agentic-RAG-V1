@@ -77,9 +77,11 @@ except Exception:
     pass
 
 # CORS middleware
+_ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+_ALLOWED_LIST = [o.strip() for o in _ALLOWED_ORIGINS.split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_LIST,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -153,6 +155,15 @@ async def auth_and_rate_limit_middleware(request: Request, call_next):
             return resp
     try:
         response = await call_next(request)
+        # Security headers
+        csp = os.getenv("CONTENT_SECURITY_POLICY",
+                        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'")
+        response.headers["Content-Security-Policy"] = csp
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "microphone=(), camera=(), geolocation=()"
+        # Only meaningful over HTTPS; harmless if HTTP
+        response.headers.setdefault("Strict-Transport-Security", "max-age=15552000; includeSubDomains")
         return response
     except Exception as e:
         METRICS["http_errors_total"] = METRICS.get("http_errors_total", 0) + 1
@@ -2118,7 +2129,7 @@ async def get_demo():
                                 </div>
                             </div>
                             <!-- Filters Bar -->
-                            <div class="flex flex-wrap gap-2 items-center text-xs">
+                            <div class="flex flex-wrap gap-2 items-center text-xs sticky top-0 z-10 bg-gray-900/60 backdrop-blur supports-[backdrop-filter]:bg-gray-900/40 py-2">
                                 <div class="flex items-center gap-1">
                                     <label class="text-gray-400">Source</label>
                                     <select id="fltSource" class="ai-input px-2 py-1" style="height:32px;width:140px" onchange="applyFilters()">
@@ -2772,11 +2783,14 @@ async def get_demo():
                 }
             }
 
+            const triggerAllSearches = debounce(()=>{ performSearch(); performSemanticSearch(); performHybridSearch(); }, 250);
+            document.getElementById('searchInput').addEventListener('input', triggerAllSearches);
+
             function performSearch() {
                 const query = document.getElementById('searchInput').value.trim();
                 if (!query) return;
                 const results = document.getElementById('searchResultsKeyword');
-                results.innerHTML = '<div class="text-sm text-gray-400">Searching…</div>';
+                renderSkeleton('searchResultsKeyword', 4);
 
                 fetch(`/search?query=${encodeURIComponent(query)}&meeting_id=${encodeURIComponent(meetingId)}&k=20`)
                     .then(r => r.json())
@@ -2800,12 +2814,12 @@ async def get_demo():
                             answerHtml = `<div class="mb-2"><div class="text-sm text-purple-300 mb-1">Answer</div><div class="text-sm text-gray-200">${escapeHtml(data.answer)}</div></div>`;
                         }
                         if (!data.hits || data.hits.length === 0) {
-                            results.innerHTML = answerHtml || '<div class="text-sm text-gray-400">No results.</div>';
+                            results.innerHTML = answerHtml || '<div class="text-sm text-gray-400">No results. Try another keyword or use the Semantic/Hybrid panels.</div>';
                             return;
                         }
                         // Simple highlighter
                         const hi = (t)=> (t||'').replace(new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'ig'), m=>`<mark class="bg-yellow-600/40 px-1 rounded">${m}</mark>`);
-                        const items = data.hits.map(h => {
+                        const cards = data.hits.map(h => {
                             if (h.source === 'transcript') {
                                 const dsrc = 'transcript';
                                 const dfile = '';
@@ -2828,13 +2842,18 @@ async def get_demo():
                         }).join('');
                         // Filters UI
                         const filters = `<div class="flex gap-2 mb-2 text-xs"><button id="filterAll" class="px-2 py-1 rounded bg-gray-700">All</button><button id="filterTranscript" class="px-2 py-1 rounded bg-gray-700">Transcript</button><button id="filterDocs" class="px-2 py-1 rounded bg-gray-700">Docs</button></div>`;
-                        results.innerHTML = `${answerHtml}<div class=\"text-sm text-gray-400 mb-2\">${data.count} results</div>${filters}<div id=\"searchList\">${items}</div>`;
+                        results.innerHTML = `${answerHtml}<div class=\"text-sm text-gray-400 mb-2\">${data.count} results</div>${filters}<div id=\"searchList\"></div>`;
                         // Filter behavior
+                        const arr = Array.isArray(data.hits) ? data.hits.map(()=>"") : [];
+                        // Use the already-built HTML cards string by splitting at boundary is unsafe; instead rebuild array
+                        const cardArr = data.hits.map(h=>{ if (h.source==='transcript'){ const dsrc='transcript'; const dfile=''; const dpage=''; const dspeaker=h.speaker||''; return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\" data-source=\"${dsrc}\" data-file=\"${dfile}\" data-page=\"${dpage}\" data-speaker=\"${escapeHtml(dspeaker)}\">\n`+`  <div class=\"text-xs text-gray-500 mb-1\">Transcript • ${new Date(h.timestamp).toLocaleTimeString()}</div>\n`+`  <div class=\"text-sm text-gray-200\"><strong>${escapeHtml(h.speaker)}:</strong> ${hi(escapeHtml(h.text))}</div>\n`+`</div>`;} else { const dsrc='document'; const dfile=h.file_id||''; const dpage=''; const dspeaker=''; return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\" data-source=\"${dsrc}\" data-file=\"${dfile}\" data-page=\"${dpage}\" data-speaker=\"${escapeHtml(dspeaker)}\">\n`+`  <div class=\"text-xs text-gray-500 mb-1\">Document • ${escapeHtml(h.filename || '')}</div>\n`+`  <div class=\"text-sm text-gray-200\">${hi(escapeHtml(h.snippet || ''))}</div>\n`+`</div>`; }});
+                        renderBatched('searchList', cardArr, 10);
                         applyFilters();
                     })
                     .catch(e => {
                         console.error('Search error', e);
                         results.innerHTML = '<div class="text-sm text-red-400">Search failed.</div>';
+                        showToast('error','Keyword search failed');
                     });
             }
 
@@ -2847,15 +2866,15 @@ async def get_demo():
                 if (!query) return;
                 const results = document.getElementById('searchResultsSemantic');
                 const totalEl = document.getElementById('semanticTotal');
-                results.innerHTML = '<div class="text-sm text-gray-400">Semantic searching…</div>';
+                renderSkeleton('searchResultsSemantic', 5);
                 fetch(`/semantic_search?query=${encodeURIComponent(query)}&page=${semPage}&per_page=10`)
                     .then(r => r.json())
                     .then(data => {
                         if (!data.hits || data.hits.length === 0) {
-                            results.innerHTML = '<div class="text-sm text-gray-400">No semantic matches.</div>';
+                            results.innerHTML = '<div class="text-sm text-gray-400">No semantic matches. Consider different wording or check the Hybrid panel.</div>';
                             return;
                         }
-                        const items = data.hits.map(h => {
+                        const cards = data.hits.map(h => {
                             const page = (typeof h.page_idx === 'number') ? ` • p. ${h.page_idx+1}` : '';
                             const meta = h.kind === 'transcript' ? `Transcript • ${h.timestamp||''}` : `Document • ${h.file_id||''}${page}`;
                             const dsrc = h.kind;
@@ -2870,11 +2889,12 @@ async def get_demo():
                         const total = data.total || data.count || 0;
                         document.getElementById('semanticPageLabel').textContent = `Page ${data.page||semPage}`;
                         totalEl.textContent = `${total} results`;
-                        results.innerHTML = items;
+                        renderBatched('searchResultsSemantic', data.hits.map(h=>{ const page=(typeof h.page_idx==='number')?` • p. ${h.page_idx+1}`:''; const meta=h.kind==='transcript'?`Transcript • ${h.timestamp||''}`:`Document • ${h.file_id||''}${page}`; const dsrc=h.kind; const dfile=h.file_id||''; const dpage=(typeof h.page_idx==='number')?(h.page_idx+1):''; const dspeaker=h.speaker||''; return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\" data-source=\"${dsrc}\" data-file=\"${dfile}\" data-page=\"${dpage}\" data-speaker=\"${escapeHtml(dspeaker)}\">\n`+`  <div class=\"text-xs text-gray-500 mb-1\">${meta} • score ${Number(h.score||0).toFixed(3)}</div>\n`+`  <div class=\"text-sm text-gray-200\">${escapeHtml(h.text||'')}</div>\n`+`</div>`; }), 12);
                     })
                     .catch(e => {
                         console.error('Semantic search error', e);
                         results.innerHTML = '<div class="text-sm text-red-400">Semantic search failed.</div>';
+                        showToast('error','Semantic search failed');
                     });
             }
 
@@ -2887,15 +2907,15 @@ async def get_demo():
                 if (!query) return;
                 const results = document.getElementById('searchResultsHybrid');
                 const totalEl = document.getElementById('hybridTotal');
-                results.innerHTML = '<div class="text-sm text-gray-400">Hybrid searching…</div>';
+                renderSkeleton('searchResultsHybrid', 6);
                 fetch(`/hybrid_search?query=${encodeURIComponent(query)}&page=${hybridPage}&per_page=10`)
                     .then(r => r.json())
                     .then(data => {
                         if (!data.hits || data.hits.length === 0) {
-                            results.innerHTML = '<div class="text-sm text-gray-400">No hybrid matches.</div>';
+                            results.innerHTML = '<div class="text-sm text-gray-400">No hybrid matches. Try adjusting alpha or refine your query.</div>';
                             return;
                         }
-                        const items = data.hits.map(h => {
+                        const cards = data.hits.map(h => {
                             const page = (typeof h.page_idx === 'number') ? ` • p. ${h.page_idx+1}` : '';
                             const meta = h.kind === 'transcript' ? `Transcript • ${h.timestamp||''}` : `Document • ${h.file_id||''}${page}`;
                             const openBtn = (h.file_id && (typeof h.page_idx === 'number')) ? `<a target=\"_blank\" href=\"/files/view/${h.file_id}#page=${h.page_idx+1}\" class=\"ml-2 text-xs text-blue-400 underline\">Open</a>` : '';
@@ -2910,10 +2930,10 @@ async def get_demo():
                         }).join('');
                         totalEl.textContent = `${data.count||data.hits.length} results`;
                         document.getElementById('hybridPageLabel').textContent = `Page ${hybridPage}`;
-                        results.innerHTML = items;
+                        renderBatched('searchResultsHybrid', data.hits.map(h=>{ const page=(typeof h.page_idx==='number')?` • p. ${h.page_idx+1}`:''; const meta=h.kind==='transcript'?`Transcript • ${h.timestamp||''}`:`Document • ${h.file_id||''}${page}`; const openBtn=(h.file_id&&(typeof h.page_idx==='number'))?`<a target=\"_blank\" href=\"/files/view/${h.file_id}#page=${h.page_idx+1}\" class=\"ml-2 text-xs text-blue-400 underline\">Open</a>`:''; const dsrc=h.kind; const dfile=h.file_id||''; const dpage=(typeof h.page_idx==='number')?(h.page_idx+1):''; const dspeaker=h.speaker||''; return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\" data-source=\"${dsrc}\" data-file=\"${dfile}\" data-page=\"${dpage}\" data-speaker=\"${escapeHtml(dspeaker)}\">\n`+`  <div class=\"text-xs text-gray-500 mb-1\">${meta} • score ${Number(h.score||0).toFixed(3)} ${openBtn}</div>\n`+`  <div class=\"text-sm text-gray-200\">${escapeHtml(h.text||'')}</div>\n`+`</div>`; }), 12);
                         applyFilters();
                     })
-                    .catch(e => { console.error('Hybrid search error', e); results.innerHTML = '<div class=\"text-sm text-red-400\">Hybrid search failed.</div>'; });
+                    .catch(e => { console.error('Hybrid search error', e); results.innerHTML = '<div class="text-sm text-red-400">Hybrid search failed.</div>'; showToast('error','Hybrid search failed'); });
             }
 
             function applyFilters(){
@@ -2939,6 +2959,65 @@ async def get_demo():
                         el.style.display = ok ? 'block' : 'none';
                     });
                 }
+            }
+
+            // Toasts and helpers
+            function ensureToastContainer(){
+                let c = document.getElementById('toastContainer');
+                if (!c){
+                    c = document.createElement('div');
+                    c.id = 'toastContainer';
+                    c.className = 'fixed top-4 right-4 z-50 space-y-2';
+                    document.body.appendChild(c);
+                }
+                return c;
+            }
+            function showToast(kind, msg){
+                const c = ensureToastContainer();
+                const colors = { success: 'bg-emerald-600', error: 'bg-red-600', info: 'bg-slate-700', warn: 'bg-amber-600' };
+                const toast = document.createElement('div');
+                toast.className = `${colors[kind]||colors.info} text-white text-sm px-3 py-2 rounded shadow-lg animate-in fade-in slide-in-from-right-2`;
+                toast.setAttribute('role','status');
+                toast.innerText = msg;
+                c.appendChild(toast);
+                setTimeout(()=>{ toast.classList.add('opacity-0'); setTimeout(()=> toast.remove(), 300); }, 2400);
+            }
+            function renderSkeleton(containerId, count){
+                const root = document.getElementById(containerId);
+                if (!root) return;
+                const card = ()=> `<div class=\"p-3 rounded border border-gray-700 bg-gray-800/40\">\n`
+                    + `  <div class=\"h-3 w-32 bg-gray-700/60 rounded animate-pulse mb-2\"></div>\n`
+                    + `  <div class=\"space-y-2\">\n`
+                    + `    <div class=\"h-3 bg-gray-700/50 rounded animate-pulse\"></div>\n`
+                    + `    <div class=\"h-3 bg-gray-700/40 rounded animate-pulse w-5/6\"></div>\n`
+                    + `  </div>\n`
+                    + `</div>`;
+                root.innerHTML = new Array(Math.max(1, count)).fill(0).map(()=>card()).join('');
+            }
+
+            // Debounce utility
+            function debounce(fn, delay){
+                let t; return function(...args){ clearTimeout(t); t = setTimeout(()=>fn.apply(this,args), delay); };
+            }
+            // Progressive renderer (batches appends for smoother paint)
+            function renderBatched(containerId, items, batchSize){
+                const root = document.getElementById(containerId);
+                if (!root) return;
+                root.innerHTML = '';
+                let i = 0; const n = items.length; const bs = Math.max(1, batchSize||10);
+                function step(){
+                    const end = Math.min(i+bs, n);
+                    const frag = document.createDocumentFragment();
+                    for (; i<end; i++){
+                        const wrap = document.createElement('div');
+                        wrap.innerHTML = items[i];
+                        const child = wrap.firstElementChild || document.createElement('div');
+                        frag.appendChild(child);
+                    }
+                    root.appendChild(frag);
+                    if (i < n) requestAnimationFrame(step);
+                }
+                requestAnimationFrame(step);
             }
 
             // Basic HTML escaper
@@ -2970,6 +3049,25 @@ async def get_demo():
             document.getElementById('messageInput').addEventListener('keypress', function(e) {
                 if (e.key === 'Enter') {
                     sendMessage();
+                }
+            });
+
+            // Keyboard shortcuts
+            document.addEventListener('keydown', function(e){
+                const tag = (e.target && e.target.tagName || '').toLowerCase();
+                const inInput = tag === 'input' || tag === 'textarea' || (e.target && e.target.isContentEditable);
+                // '/' focuses search unless typing in an input
+                if (e.key === '/' && !inInput){ e.preventDefault(); const si=document.getElementById('searchInput'); if (si){ si.focus(); si.select(); } }
+                // 'a' focuses ask
+                if (e.key.toLowerCase() === 'a' && !inInput){ const ai=document.getElementById('askInput'); if (ai){ ai.focus(); ai.select(); } }
+                // Ctrl/Cmd+Enter triggers Ask when askInput focused
+                if ((e.ctrlKey || e.metaKey) && e.key === 'Enter'){
+                    if (document.activeElement && document.activeElement.id === 'askInput'){ e.preventDefault(); performAsk(); }
+                }
+                // Arrow keys: left/right for semantic page; shift+left/right for hybrid
+                if (!inInput && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')){
+                    if (e.shiftKey){ if (e.key === 'ArrowLeft') hybridPrev(); else hybridNext(); }
+                    else { if (e.key === 'ArrowLeft') semanticPrev(); else semanticNext(); }
                 }
             });
 
@@ -3034,6 +3132,14 @@ async def get_demo():
             // Generate meeting summary (calls backend)
             function generateSummary() {
                 const summarySection = document.getElementById('summarySection');
+                const dest = document.getElementById('askAnswer');
+                dest.innerHTML = `<div class=\"p-3 rounded border border-gray-700 bg-gray-800/40\">\n`
+                               + `  <div class=\"h-3 w-24 bg-gray-700/60 rounded animate-pulse mb-2\"></div>\n`
+                               + `  <div class=\"space-y-2\">\n`
+                               + `    <div class=\"h-3 bg-gray-700/50 rounded animate-pulse\"></div>\n`
+                               + `    <div class=\"h-3 bg-gray-700/40 rounded animate-pulse w-5/6\"></div>\n`
+                               + `  </div>\n`
+                               + `</div>`;
                 const summaryContent = document.getElementById('meetingSummary');
                 summaryContent.innerHTML = '<div class="text-sm text-gray-400">Generating summary…</div>';
                 fetch(`/meetings/${encodeURIComponent(meetingId)}/summarize`, { method: 'POST' })
