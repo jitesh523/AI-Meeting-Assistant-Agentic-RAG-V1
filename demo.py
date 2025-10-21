@@ -1138,6 +1138,39 @@ async def ask(payload: dict):
     METRICS["ask_latency_ms_count"] = METRICS.get("ask_latency_ms_count", 0) + 1
     return result
 
+from fastapi.responses import StreamingResponse
+@app.get("/ask_stream")
+async def ask_stream(query: str, meeting_id: Optional[str] = None, k: int = 6, alpha: float = 0.6, rerank: bool = False):
+    q = (query or "").strip()
+    if not q:
+        raise HTTPException(status_code=400, detail="query required")
+    async def event_gen():
+        try:
+            sem = await semantic_search(q, page=1, per_page=int(k), rerank=bool(rerank))
+            hyb = await hybrid_search(q, meeting_id=meeting_id, alpha=float(alpha), k=int(k))
+            # merge simple
+            seen = set(); cands = []
+            for h in (hyb.get("hits", []) + sem.get("hits", [])):
+                _id = h.get("id")
+                if _id and _id not in seen:
+                    seen.add(_id); cands.append(h)
+                if len(cands) >= int(k):
+                    break
+            # Build simple context and synthesize text (non-streaming LLM path)
+            ctx = "\n\n".join((c.get("text") or "")[:500] for c in cands)
+            answer = f"Here is a concise answer based on {len(cands)} citations: "
+            # stream tokens from a simple heuristic split
+            for part in (answer + ctx[:1000]).split():
+                yield f"data: {part} \n\n"
+                await asyncio.sleep(0.01)
+            # send citations as a JSON payload
+            cites = [{"id": c.get("id"), "label": (c.get("file_id") or c.get("kind") or ""), "page_idx": c.get("page_idx")} for c in cands]
+            yield "event: citations\n" + f"data: {pyjson.dumps(cites)}\n\n"
+            yield "event: done\ndata: end\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {str(e)}\n\n"
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
 @app.get("/meetings/{meeting_id}/suggestions")
 async def get_suggestions(meeting_id: str):
     return {
@@ -2155,8 +2188,9 @@ async def get_demo():
                                 <button class="ai-button-secondary px-3" onclick="clearFilters()">Clear</button>
                             </div>
                             <div class="flex gap-2 items-center">
-                                <input type="text" id="askInput" class="ai-input flex-1" placeholder="Ask a question across transcript and docs...">
-                                <button class="ai-button-secondary px-4" onclick="performAsk()">Ask</button>
+                                <input type="text" id="askInput" class="ai-input flex-1" placeholder="Ask a question across transcript and docs..." aria-label="Ask question input">
+                                <label class="flex items-center gap-1 text-xs text-gray-400"><input id="askStream" type="checkbox" class="accent-blue-500"> Stream</label>
+                                <button class="ai-button-secondary px-4" onclick="performAsk()" aria-label="Ask">Ask</button>
                                 <div class="flex items-center gap-2 text-xs">
                                     <label for="hybridAlpha" class="text-gray-400">alpha</label>
                                     <input id="hybridAlpha" type="range" min="0" max="1" step="0.1" value="0.6" class="w-32" oninput="document.getElementById('hybridAlphaVal').textContent=this.value; performHybridSearch()">
@@ -2472,6 +2506,9 @@ async def get_demo():
                             participants: ["Alex Thompson", "Sarah Chen", "Marcus Johnson", "Emily Rodriguez", "David Kim"]
                         })
                     });
+
+            // Apply accessibility attributes after DOM is ready
+            applyA11y();
                     
                     if (response.ok) {
                         console.log('Meeting started successfully');
@@ -2933,205 +2970,46 @@ async def get_demo():
                         renderBatched('searchResultsHybrid', data.hits.map(h=>{ const page=(typeof h.page_idx==='number')?` • p. ${h.page_idx+1}`:''; const meta=h.kind==='transcript'?`Transcript • ${h.timestamp||''}`:`Document • ${h.file_id||''}${page}`; const openBtn=(h.file_id&&(typeof h.page_idx==='number'))?`<a target=\"_blank\" href=\"/files/view/${h.file_id}#page=${h.page_idx+1}\" class=\"ml-2 text-xs text-blue-400 underline\">Open</a>`:''; const dsrc=h.kind; const dfile=h.file_id||''; const dpage=(typeof h.page_idx==='number')?(h.page_idx+1):''; const dspeaker=h.speaker||''; return `<div class=\"p-3 rounded bg-gray-800/60 border border-gray-700\" data-source=\"${dsrc}\" data-file=\"${dfile}\" data-page=\"${dpage}\" data-speaker=\"${escapeHtml(dspeaker)}\">\n`+`  <div class=\"text-xs text-gray-500 mb-1\">${meta} • score ${Number(h.score||0).toFixed(3)} ${openBtn}</div>\n`+`  <div class=\"text-sm text-gray-200\">${escapeHtml(h.text||'')}</div>\n`+`</div>`; }), 12);
                         applyFilters();
                     })
-                    .catch(e => { console.error('Hybrid search error', e); results.innerHTML = '<div class="text-sm text-red-400">Hybrid search failed.</div>'; showToast('error','Hybrid search failed'); });
+                    }).catch(e=>{ console.error('Ask error', e); dest.innerHTML = '<div class="text-sm text-red-400">Ask failed.</div>'; showToast('error','Ask failed'); });
+            }
+
+            function performAskStream(q){
+                const dest = document.getElementById('askAnswer');
+                dest.innerHTML = `<div class=\"p-3 rounded border border-gray-700 bg-gray-800/40\"><div class=\"text-sm text-gray-200\" id=\"askStreamText\"></div><div id=\"askStreamCites\" class=\"mt-2 flex flex-wrap gap-2\"></div></div>`;
+                if (_askES){ try{ _askES.close(); }catch(_){} }
+                const params = new URLSearchParams({ query: q, alpha: String(parseFloat(document.getElementById('hybridAlpha')?.value||'0.6')), rerank: 'true' });
+                const es = new EventSource(`/ask_stream?${params.toString()}`);
+                _askES = es;
+                const textEl = document.getElementById('askStreamText');
+                const citeEl = document.getElementById('askStreamCites');
+                es.onmessage = (ev)=>{ if (!ev.data) return; textEl.textContent += (textEl.textContent ? ' ' : '') + ev.data; };
+                es.addEventListener('citations', (ev)=>{
+                    try{
+                        const cites = JSON.parse(ev.data||'[]');
+                        citeEl.innerHTML = cites.map((c,i)=>`<button class=\"text-xs px-2 py-1 rounded bg-blue-500/10 border border-blue-500/30 text-blue-300\" onclick=\"scrollToCitation('${c.id||''}')\">[${i+1}] ${c.label||''}${(typeof c.page_idx==='number')?(' • p.'+(c.page_idx+1)) : ''}</button>`).join(' ');
+                    }catch(_){}
+                });
+                es.addEventListener('done', ()=>{ try{ es.close(); }catch(_){} });
+                es.addEventListener('error', ()=>{ try{ es.close(); }catch(_){} showToast('error','Streaming failed'); });
             }
 
             function applyFilters(){
                 const src = (document.getElementById('fltSource').value||'').toLowerCase();
                 const fid = (document.getElementById('fltFile').value||'').trim();
-                const pmin = parseInt(document.getElementById('fltPageMin').value||'');
-                const pmax = parseInt(document.getElementById('fltPageMax').value||'');
-                const spk = (document.getElementById('fltSpeaker').value||'').toLowerCase();
-                const lists = ['searchResultsKeyword','searchResultsSemantic','searchResultsHybrid'];
-                for (const lid of lists){
-                    const root = document.getElementById(lid); if(!root) continue;
-                    Array.from(root.children).forEach(el=>{
-                        let ok = true;
-                        const esrc = (el.getAttribute('data-source')||'').toLowerCase();
-                        const efile = el.getAttribute('data-file')||'';
-                        const epage = parseInt(el.getAttribute('data-page')||'');
-                        const espk = (el.getAttribute('data-speaker')||'').toLowerCase();
-                        if (src && esrc !== src) ok = false;
-                        if (fid && efile && !efile.includes(fid)) ok = false;
-                        if (!isNaN(pmin) && !isNaN(epage) && epage < pmin) ok = false;
-                        if (!isNaN(pmax) && !isNaN(epage) && epage > pmax) ok = false;
-                        if (spk && (!espk || !espk.includes(spk))) ok = false;
-                        el.style.display = ok ? 'block' : 'none';
-                    });
-                }
-            }
-
-            // Toasts and helpers
-            function ensureToastContainer(){
-                let c = document.getElementById('toastContainer');
-                if (!c){
-                    c = document.createElement('div');
-                    c.id = 'toastContainer';
-                    c.className = 'fixed top-4 right-4 z-50 space-y-2';
-                    document.body.appendChild(c);
-                }
-                return c;
-            }
-            function showToast(kind, msg){
-                const c = ensureToastContainer();
-                const colors = { success: 'bg-emerald-600', error: 'bg-red-600', info: 'bg-slate-700', warn: 'bg-amber-600' };
-                const toast = document.createElement('div');
-                toast.className = `${colors[kind]||colors.info} text-white text-sm px-3 py-2 rounded shadow-lg animate-in fade-in slide-in-from-right-2`;
-                toast.setAttribute('role','status');
-                toast.innerText = msg;
-                c.appendChild(toast);
-                setTimeout(()=>{ toast.classList.add('opacity-0'); setTimeout(()=> toast.remove(), 300); }, 2400);
-            }
-            function renderSkeleton(containerId, count){
-                const root = document.getElementById(containerId);
-                if (!root) return;
-                const card = ()=> `<div class=\"p-3 rounded border border-gray-700 bg-gray-800/40\">\n`
-                    + `  <div class=\"h-3 w-32 bg-gray-700/60 rounded animate-pulse mb-2\"></div>\n`
-                    + `  <div class=\"space-y-2\">\n`
-                    + `    <div class=\"h-3 bg-gray-700/50 rounded animate-pulse\"></div>\n`
-                    + `    <div class=\"h-3 bg-gray-700/40 rounded animate-pulse w-5/6\"></div>\n`
-                    + `  </div>\n`
-                    + `</div>`;
-                root.innerHTML = new Array(Math.max(1, count)).fill(0).map(()=>card()).join('');
-            }
-
-            // Debounce utility
-            function debounce(fn, delay){
-                let t; return function(...args){ clearTimeout(t); t = setTimeout(()=>fn.apply(this,args), delay); };
-            }
-            // Progressive renderer (batches appends for smoother paint)
-            function renderBatched(containerId, items, batchSize){
-                const root = document.getElementById(containerId);
-                if (!root) return;
-                root.innerHTML = '';
-                let i = 0; const n = items.length; const bs = Math.max(1, batchSize||10);
-                function step(){
-                    const end = Math.min(i+bs, n);
-                    const frag = document.createDocumentFragment();
-                    for (; i<end; i++){
-                        const wrap = document.createElement('div');
-                        wrap.innerHTML = items[i];
-                        const child = wrap.firstElementChild || document.createElement('div');
-                        frag.appendChild(child);
-                    }
-                    root.appendChild(frag);
-                    if (i < n) requestAnimationFrame(step);
-                }
-                requestAnimationFrame(step);
-            }
-
-            // Basic HTML escaper
-            function escapeHtml(s){ return (s||'').replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]||c)); }
-
-            const uploadArea = document.getElementById('fileUploadArea');
-            
-            uploadArea.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                uploadArea.classList.add('dragover');
-            });
-            
-            uploadArea.addEventListener('dragleave', (e) => {
-                e.preventDefault();
-                uploadArea.classList.remove('dragover');
-            });
-            
-            uploadArea.addEventListener('drop', (e) => {
-                e.preventDefault();
-                uploadArea.classList.remove('dragover');
-                
-                const files = e.dataTransfer.files;
-                for (let file of files) {
-                    uploadFile(file);
-                }
-            });
-
-            // Handle Enter key in input
-            document.getElementById('messageInput').addEventListener('keypress', function(e) {
-                if (e.key === 'Enter') {
-                    sendMessage();
-                }
-            });
-
-            // Keyboard shortcuts
-            document.addEventListener('keydown', function(e){
-                const tag = (e.target && e.target.tagName || '').toLowerCase();
-                const inInput = tag === 'input' || tag === 'textarea' || (e.target && e.target.isContentEditable);
-                // '/' focuses search unless typing in an input
-                if (e.key === '/' && !inInput){ e.preventDefault(); const si=document.getElementById('searchInput'); if (si){ si.focus(); si.select(); } }
-                // 'a' focuses ask
-                if (e.key.toLowerCase() === 'a' && !inInput){ const ai=document.getElementById('askInput'); if (ai){ ai.focus(); ai.select(); } }
-                // Ctrl/Cmd+Enter triggers Ask when askInput focused
-                if ((e.ctrlKey || e.metaKey) && e.key === 'Enter'){
-                    if (document.activeElement && document.activeElement.id === 'askInput'){ e.preventDefault(); performAsk(); }
-                }
-                // Arrow keys: left/right for semantic page; shift+left/right for hybrid
-                if (!inInput && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')){
-                    if (e.shiftKey){ if (e.key === 'ArrowLeft') hybridPrev(); else hybridNext(); }
-                    else { if (e.key === 'ArrowLeft') semanticPrev(); else semanticNext(); }
-                }
-            });
-
-            // Handle Enter key in search input
-            document.getElementById('searchInput').addEventListener('keypress', function(e) {
-                if (e.key === 'Enter') {
-                    performSearch();
-                }
-            });
-            
-            // Handle Enter key in chat input
-            document.getElementById('messageInput').addEventListener('keypress', function(e) {
-                if (e.key === 'Enter') {
-                    sendMessage();
-                }
-            });
-
-            // Suggestion tab switching
-            function switchSuggestionTab(category) {
-                // Update tab buttons
-                document.querySelectorAll('.suggestion-tab').forEach(tab => {
-                    tab.classList.remove('active');
-                });
-                document.getElementById(`tab-${category}`).classList.add('active');
-
-                // Filter suggestions
-                const suggestions = document.querySelectorAll('.suggestion-card');
-                suggestions.forEach(suggestion => {
-                    if (category === 'all' || suggestion.dataset.category === category) {
-                        suggestion.style.display = 'block';
-                    } else {
-                        suggestion.style.display = 'none';
-                    }
-                });
-            }
-
-            // Settings modal
-            function toggleSettings() {
-                // Simple settings toggle - could be expanded to a full modal
-                alert('Settings panel will be implemented in the next iteration!\n\nPlanned features:\n• Privacy controls\n• Language settings\n• Notification preferences\n• Theme customization');
-            }
-
-            // Export transcript
-            function exportTranscript() {
-                const transcript = document.getElementById('transcript');
-                const text = Array.from(transcript.children).map(entry => {
-                    const speaker = entry.querySelector('.font-semibold').textContent;
-                    const content = entry.querySelector('p').textContent;
-                    const time = entry.querySelector('.text-xs').textContent;
-                    return `[${time}] ${speaker}: ${content}`;
-                }).join('\n\n');
-
-                const blob = new Blob([text], { type: 'text/plain' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `meeting-transcript-${new Date().toISOString().split('T')[0]}.txt`;
+{{ ... }}
                 a.click();
                 URL.revokeObjectURL(url);
             }
 
             // Generate meeting summary (calls backend)
-            function generateSummary() {
-                const summarySection = document.getElementById('summarySection');
+            let _askES = null;
+            function performAsk(){
+                const q = (document.getElementById('askInput').value||'').trim();
+                if (!q) return;
+                if (document.getElementById('askStream') && document.getElementById('askStream').checked){
+                    performAskStream(q);
+                    return;
+                }
                 const dest = document.getElementById('askAnswer');
                 dest.innerHTML = `<div class=\"p-3 rounded border border-gray-700 bg-gray-800/40\">\n`
                                + `  <div class=\"h-3 w-24 bg-gray-700/60 rounded animate-pulse mb-2\"></div>\n`
@@ -3140,15 +3018,21 @@ async def get_demo():
                                + `    <div class=\"h-3 bg-gray-700/40 rounded animate-pulse w-5/6\"></div>\n`
                                + `  </div>\n`
                                + `</div>`;
-                const summaryContent = document.getElementById('meetingSummary');
-                summaryContent.innerHTML = '<div class="text-sm text-gray-400">Generating summary…</div>';
-                fetch(`/meetings/${encodeURIComponent(meetingId)}/summarize`, { method: 'POST' })
-                    .then(r => r.json())
-                    .then(data => {
-                        const kp = (data.key_points || []).map(p => `<li>• ${p}</li>`).join('');
-                        const ai = (data.action_items || []).map(p => `<li>• ${p}</li>`).join('');
-                        summaryContent.innerHTML = `
-                            <div class="space-y-4">
+                fetch('/ask', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({ query: q, rerank: true, alpha: parseFloat(document.getElementById('hybridAlpha')?.value||'0.6') })
+                }).then(r=>r.json()).then(data => {
+                    const answerHtml = '';
+                    if (Array.isArray(data.answers)) {
+                        const items = data.answers.map(a => {
+                            const sources = (a.sources||[]).map(s => {
+                                if (s.type === 'transcript') return `<span class="text-xs text-gray-400">[${s.label} @ ${s.timestamp||''}]</span>`;
+                                if (s.type === 'document') return `<span class="text-xs text-gray-400">[${s.label} ${s.file_id||''}]</span>`;
+                                return '';
+                            }).join(' ');
+                            return `<div class="p-3 rounded bg-gray-800/60 border border-gray-700">
+                                <div class="text-sm text-gray-200">${escapeHtml(a.text||'')}</div>
+                                <div class="mt-1">${sources}</div>
                                 <div class="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4">
                                     <h4 class="font-semibold text-blue-400 mb-2">Summary</h4>
                                     <p class="text-sm text-gray-300">${data.summary || 'No summary'}</p>
