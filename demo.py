@@ -1633,13 +1633,66 @@ async def view_file(file_id: str):
         raise HTTPException(status_code=404, detail="File not found")
     f = uploaded_files[file_id]
     src = f"/files/raw/{file_id}"
+    local_viewer = os.path.join("static", "pdfjs", "web", "viewer.html")
+    if os.path.exists(local_viewer):
+        viewer_url = f"/static/pdfjs/web/viewer.html?file={src}"
+    else:
+        viewer_url = f"https://mozilla.github.io/pdf.js/web/viewer.html?file={src}"
     html = f"""
     <!DOCTYPE html>
     <html><head><meta charset='utf-8'><title>View {f.filename}</title>
-    <style>html,body,#viewer{{height:100%;margin:0}}</style>
+    <meta name='viewport' content='width=device-width,initial-scale=1'>
+    <style>
+      html,body{{height:100%;margin:0;background:#0b0f19;color:#e5e7eb;font-family:ui-sans-serif,system-ui}} 
+      #bar{{display:flex;align-items:center;gap:8px;padding:8px;background:#0d1324;border-bottom:1px solid #1f2937;position:sticky;top:0;z-index:10}}
+      #viewer{{width:100%;height:calc(100% - 48px);border:0}}
+      .btn{{background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer}}
+      .btn:focus-visible, input:focus-visible{{outline:2px solid #60a5fa;outline-offset:2px;border-radius:4px}}
+      .inp{{background:#0b0f19;color:#e5e7eb;border:1px solid #374151;border-radius:6px;padding:6px 8px;font-size:12px;width:80px}}
+      .sep{{color:#6b7280}}
+    </style>
     </head>
     <body>
-      <iframe id="viewer" src="https://mozilla.github.io/pdf.js/web/viewer.html?file={src}" style="width:100%; height:100%; border:0"></iframe>
+      <div id='bar' role='toolbar' aria-label='PDF controls'>
+        <span style='font-size:12px;color:#9ca3af;max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'>{f.filename}</span>
+        <span class='sep'>|</span>
+        <label for='pg' style='font-size:12px;color:#9ca3af'>Page</label>
+        <input id='pg' class='inp' type='number' min='1' value='1' aria-label='Jump to page'>
+        <button class='btn' id='go'>Go</button>
+        <span class='sep'>|</span>
+        <button class='btn' id='fitw' aria-label='Fit to width'>Fit width</button>
+        <button class='btn' id='fitp' aria-label='Fit to page'>Fit page</button>
+        <span class='sep'>|</span>
+        <a class='btn' id='openSrc' href='{src}' target='_blank' rel='noopener' aria-label='Open source file'>Open source</a>
+      </div>
+      <iframe id='viewer' src='{viewer_url}'></iframe>
+      <script>
+        const iframe = document.getElementById('viewer');
+        const pg = document.getElementById('pg');
+        const go = document.getElementById('go');
+        const fitw = document.getElementById('fitw');
+        const fitp = document.getElementById('fitp');
+        function setHash(obj){
+          try{
+            const u = new URL(iframe.src, window.location.origin);
+            const p = new URLSearchParams(u.hash.replace(/^#/,''));
+            Object.entries(obj).forEach(([k,v])=>{ if (v===null) p.delete(k); else p.set(k,String(v)); });
+            const h = p.toString();
+            iframe.src = u.origin + u.pathname + u.search + (h ? ('#'+h) : '');
+          }catch(_){/* noop */}
+        }
+        go.addEventListener('click', ()=>{ const n=parseInt(pg.value||'1'); if (!isNaN(n) && n>0) setHash({page:n}); });
+        pg.addEventListener('keypress', (e)=>{ if (e.key==='Enter'){ const n=parseInt(pg.value||'1'); if (!isNaN(n) && n>0) setHash({page:n}); }});
+        fitw.addEventListener('click', ()=> setHash({ zoom:'page-width' }));
+        fitp.addEventListener('click', ()=> setHash({ zoom:'page-fit' }));
+        try{
+          const init = new URL(window.location.href);
+          const hp = init.hash.replace(/^#/, '');
+          const sp = new URLSearchParams(hp);
+          const initPage = parseInt(sp.get('page')||'1');
+          if (!isNaN(initPage) && initPage>0) pg.value = String(initPage);
+        }catch(_){/* noop */}
+      </script>
     </body></html>
     """
     return HTMLResponse(content=html)
@@ -3072,6 +3125,42 @@ async def get_demo():
                     }
                 }
             }
+            // Accessibility helpers (Phase 3A)
+            function _setAttr(id, name, val){ const el=document.getElementById(id); if(el){ el.setAttribute(name, val); } }
+            function applyA11y(){
+                // Live regions for dynamic content
+                const regions=[
+                    ['searchResultsKeyword','Keyword search results'],
+                    ['searchResultsSemantic','Semantic search results'],
+                    ['searchResultsHybrid','Hybrid search results'],
+                    ['askAnswer','Ask answer']
+                ];
+                for (const [id,label] of regions){ const el=document.getElementById(id); if(el){ el.setAttribute('role','region'); el.setAttribute('aria-live','polite'); el.setAttribute('aria-label',label); } }
+                // Inputs and controls
+                _setAttr('searchInput','aria-label','Search input');
+                _setAttr('askInput','aria-label','Ask question input');
+                _setAttr('searchBtn','aria-label','Run keyword search');
+                _setAttr('fltSource','aria-label','Filter by source');
+                _setAttr('fltFile','aria-label','Filter by file id');
+                _setAttr('fltPageMin','aria-label','Minimum page number');
+                _setAttr('fltPageMax','aria-label','Maximum page number');
+                _setAttr('fltSpeaker','aria-label','Filter by speaker');
+                const sp=document.getElementById('semanticPager'); if(sp){ sp.setAttribute('role','group'); sp.setAttribute('aria-label','Semantic results pager'); }
+                const hp=document.getElementById('hybridPager'); if(hp){ hp.setAttribute('role','group'); hp.setAttribute('aria-label','Hybrid results pager'); }
+                // Label pager buttons and Clear
+                try{
+                    sp?.querySelectorAll('button')?.forEach(b=>{ const t=(b.textContent||'').trim().toLowerCase(); if(t==='prev') b.setAttribute('aria-label','Previous semantic results page'); if(t==='next') b.setAttribute('aria-label','Next semantic results page'); });
+                    hp?.querySelectorAll('button')?.forEach(b=>{ const t=(b.textContent||'').trim().toLowerCase(); if(t==='prev') b.setAttribute('aria-label','Previous hybrid results page'); if(t==='next') b.setAttribute('aria-label','Next hybrid results page'); });
+                    Array.from(document.querySelectorAll('button')).forEach(b=>{ if((b.textContent||'').trim()==='Clear'){ b.setAttribute('aria-label','Clear filters'); } });
+                }catch(_){}
+                // Focus-visible outline
+                const st=document.createElement('style'); st.textContent = 'button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible{outline:2px solid #60a5fa;outline-offset:2px;border-radius:4px;}'; document.head.appendChild(st);
+                // Label dynamic "Open" links in results
+                const labelOpen=(root)=>{ if(!root) return; root.querySelectorAll('a').forEach(a=>{ if(((a.textContent||'').trim().toLowerCase())==='open'){ a.setAttribute('aria-label','Open document in viewer'); } }); };
+                ['searchResultsSemantic','searchResultsHybrid'].forEach(id=>{ const el=document.getElementById(id); if(!el) return; labelOpen(el); const mo=new MutationObserver(()=>labelOpen(el)); mo.observe(el,{childList:true,subtree:true}); });
+            }
+            // Apply on load
+            applyA11y();
         </script>
     </body>
     </html>
