@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -352,12 +352,15 @@ def init_db():
         # Embeddings table (JSON vector for simplicity)
         try:
             cur.execute(
-                """
+            """
                 CREATE TABLE IF NOT EXISTS embeddings (
                     id TEXT PRIMARY KEY,
                     kind TEXT,
                     text TEXT,
-                    vector TEXT
+                    vector TEXT,
+                    file_id TEXT,
+                    page_idx INTEGER,
+                    chunk_idx INTEGER
                 )
                 """
             )
@@ -1132,7 +1135,15 @@ async def ask(payload: dict):
             logger.debug(f"/ask groq error: {e}")
     if not answer:
         answer = "Based on the provided context: " + (cands[0].get("text","")[:200] if cands else "No context available.")
-    result = {"query": q, "answer": answer, "citations": citations}
+    debug_hits = [{
+        "id": h.get("id"),
+        "kind": h.get("kind"),
+        "file_id": h.get("file_id"),
+        "page_idx": h.get("page_idx"),
+        "score": h.get("score"),
+        "text": (h.get("text") or "")[:200]
+    } for h in cands]
+    result = {"query": q, "answer": answer, "citations": citations, "debug": {"hits": debug_hits}}
     dur_ms = int((time.time() - t0)*1000)
     METRICS["ask_latency_ms_sum"] = METRICS.get("ask_latency_ms_sum", 0) + dur_ms
     METRICS["ask_latency_ms_count"] = METRICS.get("ask_latency_ms_count", 0) + 1
@@ -1166,6 +1177,9 @@ async def ask_stream(query: str, meeting_id: Optional[str] = None, k: int = 6, a
             # send citations as a JSON payload
             cites = [{"id": c.get("id"), "label": (c.get("file_id") or c.get("kind") or ""), "page_idx": c.get("page_idx")} for c in cands]
             yield "event: citations\n" + f"data: {pyjson.dumps(cites)}\n\n"
+            # send debug hits
+            dbg = [{"id": h.get("id"), "kind": h.get("kind"), "file_id": h.get("file_id"), "page_idx": h.get("page_idx"), "score": h.get("score"), "text": (h.get("text") or "")[:200]} for h in cands]
+            yield "event: debug\n" + f"data: {pyjson.dumps({"hits": dbg})}\n\n"
             yield "event: done\ndata: end\n\n"
         except Exception as e:
             yield f"event: error\ndata: {str(e)}\n\n"
@@ -1764,6 +1778,199 @@ async def health_check():
         ),
         "embeddings": "sentence-transformers" if SENTENCE_TRANS_AVAILABLE else "hashing",
     }
+
+# --- Semantic Search ---
+@app.get("/semantic_search")
+async def semantic_search(query: str, page: int = 1, per_page: int = 10):
+    q = (query or "").strip()
+    if not q:
+        return {"hits": [], "total": 0, "page": page}
+    qv = compute_embedding_cached(q)
+    try:
+        rows = await adb_query_all(
+            "SELECT id, kind, text, vector, COALESCE(file_id,''), COALESCE(page_idx, -1), COALESCE(chunk_idx, -1) FROM embeddings",
+            (),
+        )
+    except Exception:
+        rows = []
+    scored = []
+    for rid, kind, text, vjson, file_id, page_idx, chunk_idx in rows:
+        try:
+            vec = pyjson.loads(vjson) if isinstance(vjson, str) else (vjson or [])
+            score = float(cosine(qv, [float(x) for x in vec]))
+            scored.append({
+                "id": rid,
+                "kind": kind,
+                "text": text,
+                "file_id": file_id or None,
+                "page_idx": (None if page_idx is None or page_idx < 0 else int(page_idx)),
+                "chunk_idx": (None if chunk_idx is None or chunk_idx < 0 else int(chunk_idx)),
+                "score": score,
+            })
+        except Exception:
+            continue
+    scored.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    total = len(scored)
+    start = max(0, (page - 1) * per_page)
+    end = start + per_page
+    return {"hits": scored[start:end], "total": total, "page": page}
+
+# --- Hybrid Search ---
+@app.get("/hybrid_search")
+async def hybrid_search(query: str, alpha: float = 0.6, page: int = 1, per_page: int = 10, k: Optional[int] = None):
+    q = (query or "").strip()
+    if not q:
+        return {"hits": [], "count": 0, "page": page}
+    alpha = max(0.0, min(1.0, float(alpha)))
+    # Keyword hits (best-effort)
+    kw_hits = []
+    try:
+        # Try FTS tables if present
+        rows_t = await adb_query_all(
+            "SELECT speaker, text, timestamp FROM transcripts_fts WHERE text MATCH ? LIMIT ?",
+            (q, 100),
+        )
+        for speaker, text, ts in rows_t:
+            kw_hits.append({"kind": "transcript", "speaker": speaker, "text": text, "timestamp": ts, "kw": 1.0})
+    except Exception:
+        # Fallback to in-memory transcript
+        for mid, uts in transcripts.items():
+            for u in uts:
+                if q.lower() in (u.text or "").lower():
+                    kw_hits.append({"kind": "transcript", "speaker": u.speaker, "text": u.text, "timestamp": u.timestamp, "kw": 1.0})
+    try:
+        rows_f = await adb_query_all(
+            "SELECT id, filename, summary FROM files_fts WHERE files_fts MATCH ? LIMIT ?",
+            (q, 100),
+        )
+        for fid, fname, summ in rows_f:
+            kw_hits.append({"kind": "document", "file_id": fid, "text": (summ or ""), "kw": 1.0})
+    except Exception:
+        for f in uploaded_files.values():
+            summ = (f.analysis or {}).get("summary", "")
+            if q.lower() in (f"{f.filename} {summ}".lower()):
+                kw_hits.append({"kind": "document", "file_id": f.id, "text": summ, "kw": 1.0})
+
+    # Semantic scores from embeddings
+    sem_resp = await semantic_search(query=q, page=1, per_page=500)
+    sem_hits = sem_resp.get("hits", [])
+    # Merge: for simplicity treat each semantic hit as a doc hit; transcripts semantic are also possible if stored
+    merged = []
+    # Normalize ranges
+    if kw_hits:
+        max_kw = max(h.get("kw", 0.0) for h in kw_hits) or 1.0
+    else:
+        max_kw = 1.0
+    if sem_hits:
+        max_sem = max(h.get("score", 0.0) for h in sem_hits) or 1.0
+    else:
+        max_sem = 1.0
+
+    # Index semantic by (file_id,page_idx,text) for naive join
+    from collections import defaultdict
+    sem_index = defaultdict(list)
+    for h in sem_hits:
+        key = (h.get("file_id"), h.get("page_idx"), (h.get("text") or "")[:200])
+        sem_index[key].append(h)
+
+    # Combine keyword hits with closest semantic scores by text overlap (naive)
+    for h in kw_hits:
+        key = (h.get("file_id"), h.get("page_idx"), (h.get("text") or "")[:200])
+        sem_list = sem_index.get(key) or []
+        sem_score = (sem_list[0].get("score", 0.0) if sem_list else 0.0)
+        score = alpha * (h.get("kw", 0.0) / max_kw) + (1 - alpha) * (sem_score / max_sem)
+        merged.append({
+            "kind": h.get("kind", "document"),
+            "text": h.get("text", ""),
+            "file_id": h.get("file_id"),
+            "speaker": h.get("speaker"),
+            "timestamp": h.get("timestamp"),
+            "page_idx": h.get("page_idx"),
+            "score": float(score),
+        })
+    # Also include top semantic-only items not present in kw
+    for h in sem_hits:
+        merged.append({
+            "kind": h.get("kind", "document"),
+            "text": h.get("text", ""),
+            "file_id": h.get("file_id"),
+            "page_idx": h.get("page_idx"),
+            "score": float((1 - alpha) * (h.get("score", 0.0) / (max_sem or 1.0))),
+        })
+
+    merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    total = len(merged)
+    start = max(0, (page - 1) * per_page)
+    end = start + per_page
+    hits = merged[start:end]
+    return {"hits": hits, "count": total, "page": page}
+
+# --- Ask endpoints ---
+class AskBody(BaseModel):
+    query: str
+    alpha: Optional[float] = 0.6
+    rerank: Optional[bool] = True
+
+@app.post("/ask")
+async def ask(body: AskBody):
+    q = (body.query or "").strip()
+    if not q:
+        return {"answers": []}
+    # Use hybrid to fetch context
+    hyb = await hybrid_search(query=q, alpha=(body.alpha or 0.6), page=1, per_page=8)
+    ctx = "\n".join([(h.get("text") or "")[:500] for h in hyb.get("hits", [])])
+    sources = []
+    for h in hyb.get("hits", [])[:5]:
+        if h.get("kind") == "transcript":
+            sources.append({"type": "transcript", "label": h.get("speaker") or "Speaker", "timestamp": h.get("timestamp")})
+        else:
+            sources.append({"type": "document", "label": "Doc", "file_id": h.get("file_id")})
+    answer_text = None
+    if groq_available and groq_client:
+        try:
+            resp = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": "Answer the question concisely using the CONTEXT."},
+                    {"role": "user", "content": f"CONTEXT:\n{ctx}\n\nQUESTION: {q}"},
+                ],
+                max_tokens=200,
+                temperature=0.5,
+            )
+            answer_text = resp.choices[0].message.content.strip()
+        except Exception:
+            answer_text = None
+    if not answer_text:
+        # Heuristic fallback
+        answer_text = (ctx[:500] + ("..." if len(ctx) > 500 else "")) or "No direct context found."
+    return {"answers": [{"text": answer_text, "sources": sources}]}
+
+@app.get("/ask_stream")
+async def ask_stream(query: str, alpha: float = 0.6):
+    q = (query or "").strip()
+    if not q:
+        return StreamingResponse(iter(["event: done\n\n"]), media_type="text/event-stream")
+
+    async def gen():
+        # Fetch context quickly
+        hyb = await hybrid_search(query=q, alpha=alpha, page=1, per_page=8)
+        ctx = " ".join([(h.get("text") or "")[:200] for h in hyb.get("hits", [])])
+        # Stream a naive answer
+        text = f"Based on the context: {ctx[:400]}"
+        for token in text.split():
+            yield f"data: {token}\n\n"
+            await asyncio.sleep(0.01)
+        # Send citations
+        cites = []
+        for h in hyb.get("hits", [])[:5]:
+            if h.get("kind") == "transcript":
+                cites.append({"type": "transcript", "label": h.get("speaker") or "Speaker", "timestamp": h.get("timestamp")})
+            else:
+                cites.append({"type": "document", "label": "Doc", "file_id": h.get("file_id")})
+        yield "event: citations\n" + f"data: {pyjson.dumps(cites)}\n\n"
+        yield "event: done\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 @app.get("/metrics")
 async def metrics():
@@ -3049,9 +3256,70 @@ async def get_demo():
             function applyFilters(){
                 const src = (document.getElementById('fltSource').value||'').toLowerCase();
                 const fid = (document.getElementById('fltFile').value||'').trim();
-{{ ... }}
-                a.click();
-                URL.revokeObjectURL(url);
+                const pmin = parseInt(document.getElementById('fltPageMin').value||'');
+                const pmax = parseInt(document.getElementById('fltPageMax').value||'');
+                const spk = (document.getElementById('fltSpeaker').value||'').toLowerCase();
+                const lists = ['searchResultsKeyword','searchResultsSemantic','searchResultsHybrid'];
+                for (const lid of lists){
+                    const root = document.getElementById(lid); if(!root) continue;
+                    Array.from(root.children).forEach(card=>{
+                        try{
+                            const csrc=(card.getAttribute('data-source')||'').toLowerCase();
+                            const cfile=(card.getAttribute('data-file')||'');
+                            const cpageStr=card.getAttribute('data-page')||'';
+                            const cpage=cpageStr?parseInt(cpageStr):null;
+                            const cspeaker=(card.getAttribute('data-speaker')||'').toLowerCase();
+                            let ok=true;
+                            if (src && csrc!==src) ok=false;
+                            if (fid && cfile!==fid) ok=false;
+                            if (!isNaN(pmin) && cpage!==null && cpage<pmin) ok=false;
+                            if (!isNaN(pmax) && cpage!==null && cpage>pmax) ok=false;
+                            if (spk && (!cspeaker || !cspeaker.includes(spk))) ok=false;
+                            card.style.display = ok ? '' : 'none';
+                        }catch(_){ card.style.display=''; }
+                    });
+                }
+            }
+
+            function exportTranscript(){
+                const list = document.getElementById('transcript');
+                const items = Array.from(list.querySelectorAll('.transcript-entry'));
+                const lines = items.map(el=>el.innerText.replace(/\n+/g,' ').trim());
+                const blob = new Blob([lines.join('\n')], {type:'text/plain'});
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a'); a.href=url; a.download='transcript.txt'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+            }
+
+            async function generateSummary(){
+                const summarySection = document.getElementById('summarySection');
+                const summaryContent = document.getElementById('meetingSummary');
+                summaryContent.innerHTML = '<div class="text-sm text-gray-400">Generating summary...</div>';
+                try{
+                    const r = await fetch(`/meetings/${meetingId}/summarize`, {method:'POST'});
+                    const data = await r.json();
+                    const kp = (data.key_points||[]).map(x=>`<li>${escapeHtml(x)}</li>`).join('');
+                    const ai = (data.action_items||[]).map(x=>`<li>${escapeHtml(x)}</li>`).join('');
+                    summaryContent.innerHTML = `
+                        <div class="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4">
+                            <h4 class="font-semibold text-blue-400 mb-2">Summary</h4>
+                            <p class="text-sm text-gray-300">${escapeHtml(data.summary||'No summary')}</p>
+                        </div>
+                        ${kp ? `<div class="bg-green-500/10 border border-green-500/20 rounded-lg p-4 mt-3">
+                            <h4 class="font-semibold text-green-400 mb-2">Key Points</h4>
+                            <ul class="text-sm text-gray-300 space-y-1">${kp}</ul>
+                        </div>` : ''}
+                        ${ai ? `<div class="bg-purple-500/10 border border-purple-500/20 rounded-lg p-4 mt-3">
+                            <h4 class="font-semibold text-purple-400 mb-2">Action Items</h4>
+                            <ul class="text-sm text-gray-300 space-y-1">${ai}</ul>
+                        </div>` : ''}
+                    `;
+                    summarySection.style.display = 'block';
+                    summarySection.scrollIntoView({ behavior: 'smooth' });
+                }catch(e){
+                    console.error('Summarize error', e);
+                    summaryContent.innerHTML = '<div class="text-sm text-red-400">Failed to generate summary.</div>';
+                    summarySection.style.display = 'block';
+                }
             }
 
             // Generate meeting summary (calls backend)
