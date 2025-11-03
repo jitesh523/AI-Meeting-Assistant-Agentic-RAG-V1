@@ -4,10 +4,12 @@ services:
   # Database
   postgres:
     image: ankane/pgvector:latest
+    env_file:
+      - ./env.example
     environment:
-      POSTGRES_DB: meeting_assistant
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
@@ -21,6 +23,8 @@ services:
   # Redis
   redis:
     image: redis:7-alpine
+    env_file:
+      - ./env.example
     ports:
       - "6379:6379"
     volumes:
@@ -36,9 +40,11 @@ services:
     build: ./services/ingestion
     ports:
       - "8001:8000"
+    env_file:
+      - ./env.example
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
     depends_on:
       postgres:
         condition: service_healthy
@@ -53,9 +59,11 @@ services:
     build: ./services/asr
     ports:
       - "8002:8000"
+    env_file:
+      - ./env.example
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
     depends_on:
       postgres:
         condition: service_healthy
@@ -70,9 +78,11 @@ services:
     build: ./services/nlu
     ports:
       - "8003:8000"
+    env_file:
+      - ./env.example
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,9 +97,11 @@ services:
     build: ./services/rag
     ports:
       - "8004:8000"
+    env_file:
+      - ./env.example
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
     depends_on:
       postgres:
         condition: service_healthy
@@ -104,9 +116,11 @@ services:
     build: ./services/agent
     ports:
       - "8005:8000"
+    env_file:
+      - ./env.example
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
     depends_on:
       postgres:
         condition: service_healthy
@@ -121,9 +135,11 @@ services:
     build: ./services/integrations
     ports:
       - "8006:8000"
+    env_file:
+      - ./env.example
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/meeting_assistant
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
     depends_on:
       postgres:
         condition: service_healthy
@@ -138,8 +154,10 @@ services:
     build: ./services/ui
     ports:
       - "3000:3000"
+    env_file:
+      - ./env.example
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8001
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
     volumes:
       - ./services/ui:/app
       - /app/node_modules
