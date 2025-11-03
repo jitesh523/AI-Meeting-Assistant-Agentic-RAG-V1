@@ -8,3 +8,4 @@ transformers==4.35.2
 torch==2.1.0
 openai==1.51.0
 python-multipart==0.0.9
+pydantic-settings==2.6.1

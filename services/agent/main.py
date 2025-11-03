@@ -12,6 +12,7 @@ import redis.asyncio as redis
 import asyncpg
 from pydantic import BaseModel
 import openai
+from .config import settings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,7 +23,7 @@ app = FastAPI(title="Agent Service", version="1.0.0")
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -114,17 +115,23 @@ async def startup():
     global redis_client, db_pool, openai_client
     
     # Redis connection
-    redis_client = redis.from_url("redis://redis:6379", decode_responses=True)
+    redis_client = redis.from_url(settings.redis_url, decode_responses=True)
     
     # Database connection pool
     db_pool = await asyncpg.create_pool(
-        "postgresql://postgres:postgres@postgres:5432/meeting_assistant",
+        settings.database_url,
         min_size=5,
         max_size=20
     )
     
     # Initialize OpenAI client
-    openai_client = openai.OpenAI(api_key="your-api-key-here")
+    if not settings.openai_api_key:
+        if settings.require_openai:
+            raise RuntimeError("OPENAI_API_KEY is required but not set")
+        logger.warning("OPENAI_API_KEY not set; features depending on LLM may be limited")
+        openai_client = None
+    else:
+        openai_client = openai.OpenAI(api_key=settings.openai_api_key)
     
     logger.info("Agent service started")
 

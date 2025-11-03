@@ -13,6 +13,7 @@ from pydantic import BaseModel
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import openai
+from .config import settings
 from sklearn.metrics.pairwise import cosine_similarity
 
 # Configure logging
@@ -24,7 +25,7 @@ app = FastAPI(title="RAG Service", version="1.0.0")
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -63,11 +64,11 @@ async def startup():
     global redis_client, db_pool, embedding_model, openai_client
     
     # Redis connection
-    redis_client = redis.from_url("redis://redis:6379", decode_responses=True)
+    redis_client = redis.from_url(settings.redis_url, decode_responses=True)
     
     # Database connection pool
     db_pool = await asyncpg.create_pool(
-        "postgresql://postgres:postgres@postgres:5432/meeting_assistant",
+        settings.database_url,
         min_size=5,
         max_size=20
     )
@@ -81,7 +82,9 @@ async def startup():
         embedding_model = None
     
     # Initialize OpenAI client
-    openai_client = openai.OpenAI(api_key="your-api-key-here")
+    if not settings.openai_api_key and settings.require_openai:
+        raise RuntimeError("OPENAI_API_KEY is required but not set")
+    openai_client = openai.OpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
     
     logger.info("RAG service started")
 
