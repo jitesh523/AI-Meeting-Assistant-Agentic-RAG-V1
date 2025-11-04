@@ -8,6 +8,9 @@ from typing import Dict, List, Optional, Any
 from fastapi import FastAPI, BackgroundTasks
 from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
 import redis.asyncio as redis
 import asyncpg
 from pydantic import BaseModel
@@ -20,6 +23,11 @@ from fastapi import Request, Response
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Agent Service", version="1.0.0")
@@ -202,6 +210,7 @@ async def process_agent_stream():
 
 # --- New: Generate suggestions directly from raw text (no audio path) ---
 @app.post("/agent/meetings/{meeting_id}/suggest-from-text")
+@limiter.limit("60/minute")
 async def suggest_from_text(meeting_id: str, inp: TextInput = Body(...)):
     try:
         nlu = NLUResult(
@@ -228,6 +237,7 @@ async def suggest_from_text(meeting_id: str, inp: TextInput = Body(...)):
 
 # --- New: Summarize meeting and fetch summary ---
 @app.post("/agent/meetings/{meeting_id}/summarize")
+@limiter.limit("10/minute")
 async def summarize_meeting(meeting_id: str):
     try:
         # Fetch last N utterances
@@ -290,6 +300,7 @@ async def summarize_meeting(meeting_id: str):
         return {"status": "error", "message": str(e)}
 
 @app.get("/agent/meetings/{meeting_id}/summary")
+@limiter.limit("60/minute")
 async def get_summary(meeting_id: str):
     try:
         async with db_pool.acquire() as conn:
@@ -445,6 +456,7 @@ async def send_to_ui(suggestions: List[Suggestion], meeting_id: str):
         logger.error(f"Error sending to UI: {e}")
 
 @app.post("/agent/suggestions/{suggestion_id}/approve")
+@limiter.limit("30/minute")
 async def approve_suggestion(suggestion_id: str, approved_by: str):
     """Approve a suggestion"""
     try:
@@ -486,6 +498,7 @@ async def approve_suggestion(suggestion_id: str, approved_by: str):
         return {"status": "error", "message": str(e)}
 
 @app.post("/agent/suggestions/{suggestion_id}/reject")
+@limiter.limit("30/minute")
 async def reject_suggestion(suggestion_id: str):
     """Reject a suggestion"""
     try:
@@ -602,6 +615,7 @@ async def create_summary(input_data: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "success", "summary_id": "summary_123"}
 
 @app.get("/agent/meetings/{meeting_id}/suggestions")
+@limiter.limit("60/minute")
 async def get_suggestions(meeting_id: str):
     """Get suggestions for a meeting"""
     try:

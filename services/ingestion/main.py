@@ -8,6 +8,9 @@ from typing import Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
 import redis.asyncio as redis
 import asyncpg
 from pydantic import BaseModel
@@ -88,6 +91,10 @@ class TextUtterance(BaseModel):
     speaker: str = "User"
     text: str
     timestamp: float = 0.0
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 
 @app.on_event("startup")
 async def startup():
@@ -185,6 +192,7 @@ async def process_audio_chunk(meeting_id: str, audio_data: bytes):
         logger.error(f"Error processing audio chunk: {e}")
 
 @app.post("/meetings/start")
+@limiter.limit("5/minute")
 async def start_meeting(metadata: MeetingMetadata):
     """Start a new meeting session"""
     try:
@@ -214,6 +222,7 @@ async def start_meeting(metadata: MeetingMetadata):
         return {"status": "error", "message": str(e)}
 
 @app.post("/meetings/{meeting_id}/end")
+@limiter.limit("10/minute")
 async def end_meeting(meeting_id: str):
     """End a meeting session"""
     try:
@@ -244,6 +253,7 @@ async def health_check():
 
 # --- New: Accept text utterances without audio ---
 @app.post("/meetings/{meeting_id}/utterances")
+@limiter.limit("60/minute")
 async def post_utterance(meeting_id: str, utterance: TextUtterance = Body(...)):
     """Accept a text utterance (fallback when no audio UI yet).
     - Stores in DB (utterances)
