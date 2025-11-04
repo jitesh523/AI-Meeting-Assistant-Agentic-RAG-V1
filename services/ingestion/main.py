@@ -4,6 +4,7 @@ Ingestion Service - WebSocket audio ingestion and real-time processing
 import asyncio
 import json
 import logging
+import re
 from typing import Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi import Body
@@ -17,7 +18,18 @@ from pydantic import BaseModel
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+class _RedactFilter(logging.Filter):
+    _email = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+    _bearer = re.compile(r"Bearer\s+[A-Za-z0-9\-_.=:+/]{10,}", re.IGNORECASE)
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.getMessage())
+        msg = self._email.sub("<redacted_email>", msg)
+        msg = self._bearer.sub("Bearer <redacted>", msg)
+        record.msg = msg
+        record.args = ()
+        return True
 logger = logging.getLogger(__name__)
+logger.addFilter(_RedactFilter())
 
 app = FastAPI(title="Ingestion Service", version="1.0.0")
 

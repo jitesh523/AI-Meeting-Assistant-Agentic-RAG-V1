@@ -4,6 +4,7 @@ Agent Service - Agentic orchestrator for tool use and decision making
 import asyncio
 import json
 import logging
+import re
 from typing import Dict, List, Optional, Any
 from fastapi import FastAPI, BackgroundTasks
 from fastapi import Body
@@ -21,14 +22,25 @@ import uuid
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from fastapi import Request, Response
 
-# Configure logging
+# Configure logging with PII redaction
 logging.basicConfig(level=logging.INFO)
+class _RedactFilter(logging.Filter):
+    _email = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+    _bearer = re.compile(r"Bearer\s+[A-Za-z0-9\-_.=:+/]{10,}", re.IGNORECASE)
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.getMessage())
+        msg = self._email.sub("<redacted_email>", msg)
+        msg = self._bearer.sub("Bearer <redacted>", msg)
+        record.msg = msg
+        record.args = ()
+        return True
 
 # Rate limiting
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 logger = logging.getLogger(__name__)
+logger.addFilter(_RedactFilter())
 
 app = FastAPI(title="Agent Service", version="1.0.0")
 
