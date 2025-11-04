@@ -1,20 +1,18 @@
 """
 ASR Service - OpenAI Whisper for offline audio-to-text processing
-Simplified version with Redis integration
+Uses Redis Streams for audio ingestion and publishes NLU events.
 """
 import asyncio
 import json
 import logging
-import os
 import numpy as np
 from typing import Dict, List, Optional
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-import redis
-import psycopg2
+import redis.asyncio as redis
+import asyncpg
 import whisper
 from pydantic import BaseModel
-from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +31,7 @@ app.add_middleware(
 
 # Global variables
 redis_client = None
-db_conn = None
+db_pool = None
 whisper_model = None
 
 class Utterance(BaseModel):
@@ -52,32 +50,24 @@ class AudioChunk(BaseModel):
     sample_rate: int
     channels: int
 
+from .config import settings
+
+
 @app.on_event("startup")
 async def startup():
     """Initialize models and connections"""
-    global redis_client, db_conn, whisper_model
-    
+    global redis_client, db_pool, whisper_model
+
     # Redis connection
-    redis_client = redis.Redis(
-        host=os.getenv("REDIS_HOST", "redis"), 
-        port=6379, 
-        decode_responses=True
+    redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+
+    # Database connection pool
+    db_pool = await asyncpg.create_pool(
+        settings.database_url,
+        min_size=5,
+        max_size=20,
     )
-    
-    # Database connection
-    try:
-        db_conn = psycopg2.connect(
-            dbname="meetings",
-            user="admin",
-            password="secret",
-            host=os.getenv("POSTGRES_HOST", "db")
-        )
-        logger.info("Connected to PostgreSQL database")
-    except Exception as e:
-        logger.error(f"Failed to connect to database: {e}")
-        # Create in-memory fallback
-        db_conn = None
-    
+
     # Load Whisper model (small for speed; use 'base' or 'large' for accuracy)
     try:
         whisper_model = whisper.load_model("small")  # Downloads ~475MB on first run
@@ -86,70 +76,80 @@ async def startup():
         logger.error(f"Failed to load Whisper model: {e}")
         whisper_model = None
 
-    # Create utterances table if not exists
-    if db_conn:
-        with db_conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS utterances (
-                    id BIGSERIAL PRIMARY KEY,
-                    meeting_id UUID,
-                    speaker TEXT,
-                    start_ms INT,
-                    end_ms INT,
-                    text TEXT,
-                    conf REAL,
-                    created_at TIMESTAMP DEFAULT NOW()
-                );
-            """)
-            db_conn.commit()
-
 @app.on_event("shutdown")
 async def shutdown():
     """Clean up connections"""
-    if db_conn:
-        db_conn.close()
+    if redis_client:
+        await redis_client.close()
+    if db_pool:
+        await db_pool.close()
 
-async def process_audio_chunks():
-    """Process audio chunks from Redis using Whisper"""
+async def process_audio_stream():
+    """Process audio chunks from Redis Stream 'audio_stream' using Whisper"""
+    last_id = "0-0"
     while True:
         try:
-            # Check for audio chunks in Redis
-            chunk = redis_client.brpop(f"meeting:*:audio", timeout=1)
-            if chunk:
-                _, data = chunk
-                data = json.loads(data)
-                
-                # Convert hex back to bytes, then to numpy array for Whisper (expects float32 [-1,1])
-                audio_bytes = bytes.fromhex(data["data"])
-                audio_array = np.frombuffer(audio_bytes, np.int16).astype(np.float32) / 32768.0  # Normalize PCM16
-                
-                # Transcribe with Whisper
-                if whisper_model:
-                    result = whisper_model.transcribe(audio_array, fp16=False)  # fp16=False for CPU
-                    
-                    # Store transcription in database
-                    if db_conn:
-                        with db_conn.cursor() as cur:
-                            cur.execute(
-                                "INSERT INTO utterances (meeting_id, speaker, start_ms, text, conf) VALUES (%s, %s, %s, %s, %s)",
-                                (data["meeting_id"], "unknown", data["timestamp"], result["text"], result.get("confidence", 0.8))
+            streams = await redis_client.xread({"audio_stream": last_id}, block=1000, count=10)
+            if not streams:
+                continue
+            for stream_key, messages in streams:
+                for message_id, fields in messages:
+                    last_id = message_id
+                    try:
+                        meeting_id = fields.get("meeting_id")
+                        audio_hex = fields.get("audio_data")
+                        timestamp = float(fields.get("timestamp", 0))
+                        # Convert hex to PCM16 -> float32 [-1,1]
+                        audio_bytes = bytes.fromhex(audio_hex) if audio_hex else b""
+                        audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+                        if whisper_model and audio_array.size > 0:
+                            loop = asyncio.get_running_loop()
+                            result = await loop.run_in_executor(
+                                None, lambda: whisper_model.transcribe(audio_array, fp16=False)
                             )
-                            db_conn.commit()
-                    
-                    # Publish to next service (e.g., NLU via Redis)
-                    redis_client.publish("nlu_process", json.dumps({
-                        "meeting_id": data["meeting_id"], 
-                        "text": result["text"],
-                        "timestamp": data["timestamp"],
-                        "confidence": result.get("confidence", 0.8)
-                    }))
-                    
-                    logger.info(f"Processed audio chunk for meeting {data['meeting_id']}: {result['text'][:50]}...")
-                else:
-                    logger.warning("Whisper model not available, skipping audio processing")
-                    
+
+                            text = result.get("text", "").strip()
+                            confidence = float(result.get("confidence", 0.8))
+
+                            # Store transcription in database
+                            async with db_pool.acquire() as conn:
+                                await conn.execute(
+                                    """
+                                    INSERT INTO utterances (meeting_id, speaker, start_ms, end_ms, text, conf)
+                                    VALUES ($1, $2, $3, $4, $5, $6)
+                                    """,
+                                    meeting_id,
+                                    "unknown",
+                                    int(timestamp * 1000),
+                                    int(timestamp * 1000) + max(1, int(len(audio_array) / 16)),
+                                    text,
+                                    confidence,
+                                )
+
+                            # Publish to NLU service
+                            await redis_client.publish(
+                                "nlu_process",
+                                json.dumps(
+                                    {
+                                        "meeting_id": meeting_id,
+                                        "speaker": "unknown",
+                                        "text": text,
+                                        "timestamp": timestamp,
+                                        "confidence": confidence,
+                                    }
+                                ),
+                            )
+
+                            logger.info(
+                                f"Processed audio chunk for meeting {meeting_id}: {text[:50]}..."
+                            )
+                        else:
+                            logger.warning("Whisper model not available or empty audio chunk")
+                    except Exception as inner_e:
+                        logger.error(f"Error processing message {message_id}: {inner_e}")
         except Exception as e:
-            logger.error(f"Error processing audio chunks: {e}")
+            logger.error(f"Error reading from audio_stream: {e}")
             await asyncio.sleep(1)
 
 @app.post("/asr/process")
@@ -158,7 +158,7 @@ async def process_audio(audio_chunk: AudioChunk, background_tasks: BackgroundTas
     try:
         if not whisper_model:
             return {"status": "error", "message": "Whisper model not available"}
-            
+        
         # Convert audio data to numpy array
         audio_array = np.frombuffer(audio_chunk.audio_data, dtype=np.int16)
         
@@ -171,7 +171,8 @@ async def process_audio(audio_chunk: AudioChunk, background_tasks: BackgroundTas
         audio_array = audio_array.astype(np.float32) / 32768.0
         
         # Transcribe with Whisper
-        result = whisper_model.transcribe(audio_array, fp16=False)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: whisper_model.transcribe(audio_array, fp16=False))
         
         # Store utterance
         utterance = Utterance(
@@ -185,21 +186,30 @@ async def process_audio(audio_chunk: AudioChunk, background_tasks: BackgroundTas
         )
         
         # Store in database
-        if db_conn:
-            with db_conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO utterances (meeting_id, speaker, start_ms, end_ms, text, conf) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (utterance.meeting_id, utterance.speaker, utterance.start_ms, utterance.end_ms, utterance.text, utterance.confidence)
-                )
-                db_conn.commit()
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO utterances (meeting_id, speaker, start_ms, end_ms, text, conf) VALUES ($1, $2, $3, $4, $5, $6)",
+                utterance.meeting_id,
+                utterance.speaker,
+                utterance.start_ms,
+                utterance.end_ms,
+                utterance.text,
+                utterance.confidence,
+            )
         
         # Send to NLU service
-        redis_client.publish("nlu_process", json.dumps({
-            "meeting_id": utterance.meeting_id,
-            "text": utterance.text,
-            "timestamp": utterance.timestamp,
-            "confidence": utterance.confidence
-        }))
+        await redis_client.publish(
+            "nlu_process",
+            json.dumps(
+                {
+                    "meeting_id": utterance.meeting_id,
+                    "speaker": utterance.speaker,
+                    "text": utterance.text,
+                    "timestamp": utterance.timestamp,
+                    "confidence": utterance.confidence,
+                }
+            ),
+        )
         
         return {"status": "success", "transcript": utterance.text}
         
@@ -211,30 +221,31 @@ async def process_audio(audio_chunk: AudioChunk, background_tasks: BackgroundTas
 async def get_transcript(meeting_id: str):
     """Get transcript for a meeting"""
     try:
-        if not db_conn:
-            return {"error": "Database not available"}
-            
-        with db_conn.cursor() as cur:
-            cur.execute("""
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
                 SELECT speaker, start_ms, end_ms, text, conf, created_at
                 FROM utterances
-                WHERE meeting_id = %s
+                WHERE meeting_id = $1
                 ORDER BY start_ms
-            """, (meeting_id,))
-            
-            rows = cur.fetchall()
-            transcript = []
-            for row in rows:
-                transcript.append({
-                    "speaker": row[0],
-                    "start_ms": row[1],
-                    "end_ms": row[2],
-                    "text": row[3],
-                    "confidence": row[4],
-                    "timestamp": row[5].isoformat() if row[5] else None
-                })
-            
-            return {"meeting_id": meeting_id, "transcript": transcript}
+                """,
+                meeting_id,
+            )
+
+        transcript = []
+        for row in rows:
+            transcript.append(
+                {
+                    "speaker": row["speaker"],
+                    "start_ms": row["start_ms"],
+                    "end_ms": row["end_ms"],
+                    "text": row["text"],
+                    "confidence": row["conf"],
+                    "timestamp": row["created_at"].isoformat() if row["created_at"] else None,
+                }
+            )
+
+        return {"meeting_id": meeting_id, "transcript": transcript}
             
     except Exception as e:
         logger.error(f"Error getting transcript: {e}")
@@ -247,13 +258,13 @@ async def health_check():
         "status": "healthy", 
         "service": "asr",
         "whisper_available": whisper_model is not None,
-        "database_available": db_conn is not None
+        "database_available": db_pool is not None
     }
 
 # Start background task
 @app.on_event("startup")
 async def start_background_tasks():
-    asyncio.create_task(process_audio_chunks())
+    asyncio.create_task(process_audio_stream())
 
 if __name__ == "__main__":
     import uvicorn
