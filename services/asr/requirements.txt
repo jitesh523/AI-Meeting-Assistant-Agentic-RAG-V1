@@ -7,3 +7,4 @@ numpy==1.26.4
 openai-whisper==20231117
 python-multipart==0.0.9
 pydantic-settings==2.6.1
+faster-whisper==1.0.3

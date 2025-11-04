@@ -6,6 +6,14 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:postgres@postgres:5432/meeting_assistant"
     redis_url: str = "redis://redis:6379"
     cors_allow_origins: List[str] = ["*"]
+    # ASR implementation: 'openai' (default) or 'faster'
+    asr_impl: str = "openai"
+    # Model size for faster-whisper or openai-whisper (e.g., 'small', 'base')
+    asr_model_size: str = "small"
+    # Device for faster-whisper: 'cpu' or 'cuda'
+    asr_device: str = "cpu"
+    # Compute type for faster-whisper: 'int8', 'int8_float16', 'float16', 'float32'
+    asr_compute_type: str = "int8"
 
     class Config:
         env_file = "../../.env"

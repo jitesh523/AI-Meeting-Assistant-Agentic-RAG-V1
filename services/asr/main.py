@@ -21,9 +21,11 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="ASR Service", version="1.0.0")
 
 # CORS middleware
+from .config import settings
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,7 +34,8 @@ app.add_middleware(
 # Global variables
 redis_client = None
 db_pool = None
-whisper_model = None
+whisper_model = None  # openai-whisper model
+faster_model = None   # faster-whisper model
 
 class Utterance(BaseModel):
     meeting_id: str
@@ -50,8 +53,42 @@ class AudioChunk(BaseModel):
     sample_rate: int
     channels: int
 
-from .config import settings
 
+async def transcribe_audio(audio_array: np.ndarray) -> tuple[str, float]:
+    """Transcribe using the selected backend. Returns (text, confidence)."""
+    loop = asyncio.get_running_loop()
+
+    # Prefer faster-whisper if available
+    if faster_model is not None:
+        def _fw() -> tuple[str, float]:
+            # Use vad_filter to improve quality a bit; reduce beam_size for speed
+            segments, info = faster_model.transcribe(
+                audio_array,
+                beam_size=1,
+                vad_filter=True,
+            )
+            text_parts = []
+            for seg in segments:
+                text_parts.append(seg.text)
+            text = " ".join(t.strip() for t in text_parts).strip()
+            # faster-whisper doesn't expose per-utterance confidence; use language_probability as a proxy if present
+            conf = float(getattr(info, "language_probability", 0.9) or 0.9)
+            return text, conf
+
+        return await loop.run_in_executor(None, _fw)
+
+    # Fallback to openai-whisper
+    if whisper_model is not None:
+        def _ow() -> tuple[str, float]:
+            result = whisper_model.transcribe(audio_array, fp16=False)
+            text = result.get("text", "").strip()
+            conf = float(result.get("confidence", 0.8))
+            return text, conf
+
+        return await loop.run_in_executor(None, _ow)
+
+    # No backend available
+    return "", 0.0
 
 @app.on_event("startup")
 async def startup():
@@ -68,13 +105,28 @@ async def startup():
         max_size=20,
     )
 
-    # Load Whisper model (small for speed; use 'base' or 'large' for accuracy)
+    # Load ASR model based on config
     try:
-        whisper_model = whisper.load_model("small")  # Downloads ~475MB on first run
-        logger.info("Whisper model loaded successfully")
+        if settings.asr_impl.lower() == "faster":
+            from faster_whisper import WhisperModel  # type: ignore
+            device = settings.asr_device
+            compute_type = settings.asr_compute_type
+            model_size = settings.asr_model_size
+            logger.info(f"Loading faster-whisper model: size={model_size}, device={device}, compute_type={compute_type}")
+            # Faster-whisper loads quickly and supports CPU/GPU
+            global faster_model
+            faster_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            logger.info("faster-whisper model loaded successfully")
+        else:
+            model_size = settings.asr_model_size
+            logger.info(f"Loading openai-whisper model: size={model_size}")
+            global whisper_model
+            whisper_model = whisper.load_model(model_size)
+            logger.info("openai-whisper model loaded successfully")
     except Exception as e:
-        logger.error(f"Failed to load Whisper model: {e}")
+        logger.error(f"Failed to load ASR model: {e}")
         whisper_model = None
+        faster_model = None
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -103,14 +155,8 @@ async def process_audio_stream():
                         audio_bytes = bytes.fromhex(audio_hex) if audio_hex else b""
                         audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-                        if whisper_model and audio_array.size > 0:
-                            loop = asyncio.get_running_loop()
-                            result = await loop.run_in_executor(
-                                None, lambda: whisper_model.transcribe(audio_array, fp16=False)
-                            )
-
-                            text = result.get("text", "").strip()
-                            confidence = float(result.get("confidence", 0.8))
+                        if audio_array.size > 0:
+                            text, confidence = await transcribe_audio(audio_array)
 
                             # Store transcription in database
                             async with db_pool.acquire() as conn:
@@ -156,8 +202,9 @@ async def process_audio_stream():
 async def process_audio(audio_chunk: AudioChunk, background_tasks: BackgroundTasks):
     """Process audio chunk directly"""
     try:
-        if not whisper_model:
-            return {"status": "error", "message": "Whisper model not available"}
+        # Validate any ASR backend available
+        if not (whisper_model or faster_model):
+            return {"status": "error", "message": "ASR model not available"}
         
         # Convert audio data to numpy array
         audio_array = np.frombuffer(audio_chunk.audio_data, dtype=np.int16)
@@ -170,9 +217,8 @@ async def process_audio(audio_chunk: AudioChunk, background_tasks: BackgroundTas
         # Normalize audio
         audio_array = audio_array.astype(np.float32) / 32768.0
         
-        # Transcribe with Whisper
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, lambda: whisper_model.transcribe(audio_array, fp16=False))
+        # Transcribe
+        text, conf = await transcribe_audio(audio_array)
         
         # Store utterance
         utterance = Utterance(
@@ -180,8 +226,8 @@ async def process_audio(audio_chunk: AudioChunk, background_tasks: BackgroundTas
             speaker="unknown",
             start_ms=0,
             end_ms=len(audio_array) * 1000 // audio_chunk.sample_rate,
-            text=result["text"].strip(),
-            confidence=float(result.get("confidence", 0.8)),
+            text=text,
+            confidence=float(conf),
             timestamp=audio_chunk.timestamp
         )
         
@@ -257,7 +303,9 @@ async def health_check():
     return {
         "status": "healthy", 
         "service": "asr",
+        "impl": ("faster" if faster_model else ("openai" if whisper_model else "none")),
         "whisper_available": whisper_model is not None,
+        "faster_available": faster_model is not None,
         "database_available": db_pool is not None
     }
 
