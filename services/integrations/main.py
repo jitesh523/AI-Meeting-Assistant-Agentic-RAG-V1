@@ -22,14 +22,51 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Integrations Service", version="1.0.0")
 
+from .config import settings
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi import Request, Response
+import time
+import uuid
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Prometheus metrics
+REQUEST_COUNT = Counter(
+    "integrations_http_requests_total",
+    "Total HTTP requests",
+    ["method", "path", "status"],
+)
+REQUEST_LATENCY = Histogram(
+    "integrations_http_request_duration_seconds",
+    "HTTP request latency in seconds",
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5),
+)
+
+
+@app.middleware("http")
+async def add_request_id_and_metrics(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    start = time.perf_counter()
+    response: Response = await call_next(request)
+    elapsed = time.perf_counter() - start
+    route_path = getattr(request.scope.get("route"), "path", request.url.path)
+    REQUEST_COUNT.labels(request.method, route_path, str(response.status_code)).inc()
+    REQUEST_LATENCY.observe(elapsed)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.get("/metrics")
+async def metrics():
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 # Global variables
 redis_client = None
@@ -76,11 +113,11 @@ async def startup():
     global redis_client, db_pool
     
     # Redis connection
-    redis_client = redis.from_url("redis://redis:6379", decode_responses=True)
+    redis_client = redis.from_url(settings.redis_url, decode_responses=True)
     
     # Database connection pool
     db_pool = await asyncpg.create_pool(
-        "postgresql://postgres:postgres@postgres:5432/meeting_assistant",
+        settings.database_url,
         min_size=5,
         max_size=20
     )

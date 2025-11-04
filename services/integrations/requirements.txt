@@ -11,3 +11,5 @@ google-api-python-client==2.149.0
 slack-sdk==3.33.2
 notion-client==2.2.3
 python-multipart==0.0.9
+pydantic-settings==2.6.1
+prometheus-client==0.20.0
