@@ -83,6 +83,8 @@ class QueryResult(BaseModel):
     documents: List[Document]
     context: str
     confidence: float
+    # Optional: per-document scores for transparency
+    similarity_scores: Optional[List[Dict[str, Any]]] = None
 
 class RAGQuery(BaseModel):
     query: str
@@ -149,8 +151,8 @@ async def process_rag_stream():
 async def process_rag_query(rag_query: RAGQuery):
     """Process a RAG query"""
     try:
-        # Retrieve relevant documents
-        documents = await retrieve_documents(rag_query)
+        # Retrieve relevant documents and scores
+        documents, sim_scores = await retrieve_documents(rag_query)
         
         # Generate context
         context = generate_context(documents)
@@ -160,7 +162,8 @@ async def process_rag_query(rag_query: RAGQuery):
             query=rag_query.query,
             documents=documents,
             context=context,
-            confidence=calculate_confidence(documents)
+            confidence=calculate_confidence(documents),
+            similarity_scores=sim_scores,
         )
         
         # Store result
@@ -174,36 +177,95 @@ async def process_rag_query(rag_query: RAGQuery):
     except Exception as e:
         logger.error(f"Error processing RAG query: {e}")
 
-async def retrieve_documents(rag_query: RAGQuery) -> List[Document]:
-    """Retrieve relevant documents using vector similarity"""
+async def retrieve_documents(rag_query: RAGQuery) -> Tuple[List[Document], List[Dict[str, Any]]]:
+    """Retrieve relevant documents using hybrid similarity (vector + lexical)."""
     try:
         # Generate query embedding
         query_embedding = generate_embedding(rag_query.query)
-        
-        # Search vector database
+
         async with db_pool.acquire() as conn:
-            # Use pgvector for similarity search
-            rows = await conn.fetch("""
-                SELECT doc_id, tenant_id, source, text, metadata, embedding
+            # Vector results (cosine distance: smaller is better). Convert to similarity = 1 - distance.
+            vrows = await conn.fetch(
+                """
+                SELECT doc_id, tenant_id, source, text, metadata, embedding,
+                       (embedding <-> $2) AS dist
                 FROM documents
                 WHERE tenant_id = $1
-                ORDER BY embedding <-> $2
+                ORDER BY dist
                 LIMIT $3
-            """, rag_query.tenant_id, query_embedding, rag_query.max_docs)
-            
-            documents = []
-            for row in rows:
-                doc = Document(
-                    doc_id=row["doc_id"],
-                    tenant_id=row["tenant_id"],
-                    source=row["source"],
-                    text=row["text"],
-                    metadata=json.loads(row["metadata"]) if row["metadata"] else {},
-                    embedding=row["embedding"]
+                """,
+                rag_query.tenant_id,
+                query_embedding,
+                rag_query.max_docs,
+            )
+
+            # Lexical results using pg_trgm; use the % operator to leverage GIN index
+            lrows = await conn.fetch(
+                """
+                SELECT doc_id, tenant_id, source, text, metadata,
+                       similarity(text, $2) AS lex
+                FROM documents
+                WHERE tenant_id = $1 AND text % $2
+                ORDER BY lex DESC
+                LIMIT $3
+                """,
+                rag_query.tenant_id,
+                rag_query.query,
+                rag_query.max_docs,
+            )
+
+        # Normalize and merge by doc_id
+        vector_scores: Dict[str, float] = {}
+        for r in vrows:
+            dist = float(r["dist"]) if r["dist"] is not None else 1.0
+            sim = max(0.0, 1.0 - dist)
+            vector_scores[str(r["doc_id"])] = sim
+
+        lexical_scores: Dict[str, float] = {}
+        for r in lrows:
+            lex = float(r["lex"]) if r["lex"] is not None else 0.0
+            lexical_scores[str(r["doc_id"])] = max(0.0, min(1.0, lex))
+
+        # Combine with weights
+        alpha = 0.7  # weight for vector
+        all_ids = set(vector_scores.keys()) | set(lexical_scores.keys())
+        combined: List[Tuple[str, float]] = []
+        for did in all_ids:
+            vs = vector_scores.get(did, 0.0)
+            ls = lexical_scores.get(did, 0.0)
+            combined.append((did, alpha * vs + (1 - alpha) * ls))
+        # Sort by combined score desc and take top max_docs
+        combined.sort(key=lambda x: x[1], reverse=True)
+        top_ids = [did for did, _ in combined[: rag_query.max_docs]]
+
+        # Build documents list preserving order
+        row_by_id: Dict[str, Any] = {str(r["doc_id"]): r for r in list(vrows) + list(lrows)}
+        documents: List[Document] = []
+        sim_scores: List[Dict[str, Any]] = []
+        for did in top_ids:
+            r = row_by_id.get(did)
+            if not r:
+                continue
+            documents.append(
+                Document(
+                    doc_id=str(r["doc_id"]),
+                    tenant_id=str(r["tenant_id"]),
+                    source=r["source"],
+                    text=r["text"],
+                    metadata=json.loads(r["metadata"]) if r["metadata"] else {},
+                    embedding=r.get("embedding", []),
                 )
-                documents.append(doc)
-            
-            return documents
+            )
+            sim_scores.append(
+                {
+                    "doc_id": did,
+                    "vector": vector_scores.get(did, 0.0),
+                    "lexical": lexical_scores.get(did, 0.0),
+                    "hybrid": next((score for _id, score in combined if _id == did), 0.0),
+                }
+            )
+
+        return documents, sim_scores
             
     except Exception as e:
         logger.error(f"Error retrieving documents: {e}")
@@ -253,14 +315,19 @@ async def store_query_result(result: QueryResult, meeting_id: str):
     """Store query result in database"""
     try:
         async with db_pool.acquire() as conn:
-            await conn.execute("""
+            await conn.execute(
+                """
                 INSERT INTO rag_results (
-                    meeting_id, query, context, confidence, 
-                    document_ids, created_at
-                ) VALUES ($1, $2, $3, $4, $5, now())
-            """, 
-                meeting_id, result.query, result.context, 
-                result.confidence, json.dumps([doc.doc_id for doc in result.documents])
+                    meeting_id, query, context, confidence,
+                    document_ids, similarity_scores, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, now())
+                """,
+                meeting_id,
+                result.query,
+                result.context,
+                result.confidence,
+                json.dumps([doc.doc_id for doc in result.documents]),
+                json.dumps(result.similarity_scores or []),
             )
             
     except Exception as e:
