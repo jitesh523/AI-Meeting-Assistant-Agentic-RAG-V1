@@ -1,0 +1,78 @@
+name: CI Smoke (Compose)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests
+
+      - name: Build images
+        run: |
+          docker compose -f docker-compose.yml build
+
+      - name: Start stack (infra + services)
+        env:
+          POSTGRES_DB: meeting_assistant
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          DATABASE_URL: postgresql://postgres:postgres@postgres:5432/meeting_assistant
+          REDIS_URL: redis://redis:6379
+        run: |
+          docker compose -f docker-compose.yml up -d
+
+      - name: Wait for core services
+        run: |
+          for url in \
+            http://localhost:8001/health \
+            http://localhost:8003/health \
+            http://localhost:8005/health; do \
+            echo "Waiting for $url"; \
+            for i in {1..40}; do \
+              if curl -fsS "$url" >/dev/null; then echo "OK $url"; break; fi; \
+              sleep 3; \
+            done; \
+          done
+
+      - name: Run smoke tests
+        env:
+          RUN_SMOKE: '1'
+          INGESTION_URL: http://localhost:8001
+          NLU_URL: http://localhost:8003
+          AGENT_URL: http://localhost:8005
+        run: |
+          pytest -q tests/smoke_test.py
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml ps
+          docker compose -f docker-compose.yml logs --no-color > compose-logs.txt
+
+      - name: Upload compose logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-logs
+          path: compose-logs.txt
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose -f docker-compose.yml down -v

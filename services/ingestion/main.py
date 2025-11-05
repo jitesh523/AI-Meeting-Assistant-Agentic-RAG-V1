@@ -15,6 +15,7 @@ from slowapi.middleware import SlowAPIMiddleware
 import redis.asyncio as redis
 import asyncpg
 from pydantic import BaseModel
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +49,36 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Optional: OpenTelemetry tracing
+if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
+        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
+        from opentelemetry.instrumentation.redis import RedisInstrumentor
+
+        resource = Resource.create({
+            "service.name": "ingestion",
+        })
+        provider = TracerProvider(resource=resource)
+        processor = BatchSpanProcessor(OTLPSpanExporter())
+        provider.add_span_processor(processor)
+        trace.set_tracer_provider(provider)
+
+        # Instrument frameworks
+        FastAPIInstrumentor.instrument_app(app)
+        ASGIInstrumentor().instrument()
+        AsyncPGInstrumentor().instrument()
+        RedisInstrumentor().instrument()
+        logger.info("OpenTelemetry tracing enabled for ingestion")
+    except Exception as _otel_err:
+        logger.warning(f"Failed to initialize OpenTelemetry: {_otel_err}")
 
 # Prometheus metrics
 REQUEST_COUNT = Counter(
