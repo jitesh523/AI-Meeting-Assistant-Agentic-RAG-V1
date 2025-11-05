@@ -31,12 +31,16 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState('')
   const [searchHits, setSearchHits] = useState<any[]>([])
   const pollingRef = useRef<NodeJS.Timeout | null>(null)
+  const sseRef = useRef<EventSource | null>(null)
 
   useEffect(() => {
     // Generate a meeting ID on client to avoid SSR hydration mismatch
     setMeetingId(`meeting_${Date.now()}`)
-    // start suggestions polling when meeting active
-    if (isListening && meetingId) {
+  }, [])
+
+  useEffect(() => {
+    // manage live suggestions via SSE with polling fallback
+    const startPolling = () => {
       if (pollingRef.current) clearInterval(pollingRef.current)
       pollingRef.current = setInterval(async () => {
         try {
@@ -45,14 +49,42 @@ export default function Home() {
             const data = await res.json()
             setSuggestions(data.suggestions || [])
           }
-        } catch (e) {
-          // ignore transient errors
-        }
+        } catch {}
       }, 2000)
     }
-    return () => {
-      if (pollingRef.current) clearInterval(pollingRef.current)
+
+    const stopAll = () => {
+      if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null }
+      if (sseRef.current) { sseRef.current.close(); sseRef.current = null }
     }
+
+    if (isListening && meetingId) {
+      stopAll()
+      try {
+        const es = new EventSource(`/api/agent/meetings/${meetingId}/suggestions/stream`)
+        sseRef.current = es
+        es.onmessage = (ev) => {
+          try {
+            const payload = JSON.parse(ev.data)
+            if (Array.isArray(payload.suggestions)) {
+              setSuggestions(payload.suggestions)
+            }
+          } catch {}
+        }
+        es.onerror = () => {
+          // fallback to polling on error
+          es.close()
+          sseRef.current = null
+          startPolling()
+        }
+      } catch {
+        startPolling()
+      }
+    } else {
+      stopAll()
+    }
+
+    return () => stopAll()
   }, [isListening, meetingId])
 
   const startMeeting = async () => {

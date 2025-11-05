@@ -21,6 +21,7 @@ import time
 import uuid
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from fastapi import Request, Response
+from starlette.responses import StreamingResponse
 
 # Configure logging with PII redaction
 logging.basicConfig(level=logging.INFO)
@@ -466,6 +467,30 @@ async def send_to_ui(suggestions: List[Suggestion], meeting_id: str):
         
     except Exception as e:
         logger.error(f"Error sending to UI: {e}")
+
+@app.get("/agent/meetings/{meeting_id}/suggestions/stream")
+async def suggestions_stream(meeting_id: str):
+    async def event_generator():
+        try:
+            pubsub = redis_client.pubsub()
+            await pubsub.subscribe("ui_suggestions")
+            try:
+                while True:
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=5.0)
+                    if message and message.get("type") == "message":
+                        data = json.loads(message["data"]) if isinstance(message["data"], str) else json.loads(message["data"].decode("utf-8"))
+                        if data.get("meeting_id") == meeting_id:
+                            payload = json.dumps({"suggestions": data.get("suggestions", [])})
+                            yield f"data: {payload}\n\n"
+            finally:
+                await pubsub.unsubscribe("ui_suggestions")
+                await pubsub.close()
+        except Exception as e:
+            logger.error(f"SSE stream error: {e}")
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+    headers = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
 
 @app.post("/agent/suggestions/{suggestion_id}/approve")
 @limiter.limit("30/minute")
