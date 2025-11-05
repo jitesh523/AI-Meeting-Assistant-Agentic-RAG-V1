@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List, Optional
 
 
@@ -9,11 +9,7 @@ class Settings(BaseSettings):
     require_openai: bool = False
     cors_allow_origins: List[str] = ["*"]
 
-    class Config:
-        env_file = "../../.env"
-        env_file_encoding = "utf-8"
-        env_prefix = ""
-        case_sensitive = False
+    model_config = SettingsConfigDict(env_file="../../.env", env_file_encoding="utf-8", case_sensitive=False, secrets_dir="/run/secrets")
 
     @classmethod
     def model_validate_environment(cls) -> "Settings":

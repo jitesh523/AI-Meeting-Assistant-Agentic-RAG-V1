@@ -19,6 +19,9 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    secrets:
+      - database_url
+      - redis_url
     mem_limit: 512m
     cpus: 0.50
 
@@ -60,6 +63,9 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    secrets:
+      - database_url
+      - redis_url
 
   asr:
     build: ./services/asr
@@ -84,6 +90,9 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    secrets:
+      - database_url
+      - redis_url
 
   nlu:
     build: ./services/nlu
@@ -207,3 +216,9 @@ services:
 volumes:
   postgres_data:
   redis_data:
+
+secrets:
+  database_url:
+    file: ./secrets/database_url
+  redis_url:
+    file: ./secrets/redis_url
