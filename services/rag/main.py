@@ -7,6 +7,9 @@ import logging
 from typing import Dict, List, Optional, Tuple, Any
 from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
 import redis.asyncio as redis
 import asyncpg
 from pydantic import BaseModel
@@ -34,6 +37,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 
 # Prometheus metrics
 REQUEST_COUNT = Counter(
@@ -349,12 +357,14 @@ async def send_to_agent(result: QueryResult, meeting_id: str):
         logger.error(f"Error sending to agent: {e}")
 
 @app.post("/rag/query")
+@limiter.limit("60/minute")
 async def query_rag(rag_query: RAGQuery, background_tasks: BackgroundTasks):
     """Query RAG system directly"""
     background_tasks.add_task(process_rag_query, rag_query)
     return {"status": "processing"}
 
 @app.get("/rag/search")
+@limiter.limit("120/minute")
 async def search_rag(q: str, tenant_id: str, k: int = 5):
     """Simple search endpoint returning top-k documents for a query"""
     try:
@@ -386,6 +396,7 @@ async def search_rag(q: str, tenant_id: str, k: int = 5):
         return {"error": str(e)}
 
 @app.post("/rag/upload")
+@limiter.limit("10/minute")
 async def upload_document(
     file: UploadFile = File(...),
     tenant_id: str = Form(...),
@@ -430,6 +441,7 @@ async def upload_document(
         return {"status": "error", "message": str(e)}
 
 @app.post("/rag/documents")
+@limiter.limit("30/minute")
 async def add_document(document: Document):
     """Add a document to the vector database"""
     try:

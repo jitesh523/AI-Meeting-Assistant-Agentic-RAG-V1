@@ -7,6 +7,9 @@ import logging
 from typing import Dict, List, Optional, Any
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
 import redis.asyncio as redis
 import asyncpg
 from pydantic import BaseModel
@@ -36,6 +39,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 
 # Prometheus metrics
 REQUEST_COUNT = Counter(
@@ -379,6 +387,7 @@ def create_email_message(to: List[str], subject: str, body: str) -> str:
 
 # API Endpoints
 @app.post("/integrations/gmail/draft")
+@limiter.limit("30/minute")
 async def draft_email(email_draft: EmailDraft, user_id: str):
     """Draft an email"""
     try:
@@ -402,6 +411,7 @@ async def draft_email(email_draft: EmailDraft, user_id: str):
         return {"status": "error", "message": str(e)}
 
 @app.post("/integrations/slack/message")
+@limiter.limit("60/minute")
 async def send_message(slack_message: SlackMessage, user_id: str):
     """Send a Slack message"""
     try:
@@ -424,6 +434,7 @@ async def send_message(slack_message: SlackMessage, user_id: str):
         return {"status": "error", "message": str(e)}
 
 @app.post("/integrations/calendar/event")
+@limiter.limit("30/minute")
 async def create_event(calendar_event: CalendarEvent, user_id: str):
     """Create a calendar event"""
     try:

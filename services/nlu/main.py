@@ -8,6 +8,9 @@ import re
 from typing import Dict, List, Optional, Tuple
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
 import redis.asyncio as redis
 import asyncpg
 from pydantic import BaseModel
@@ -34,6 +37,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
 
 # Prometheus metrics
 REQUEST_COUNT = Counter(
@@ -346,12 +354,14 @@ async def send_to_agent(nlu_result: NLUResult):
         logger.error(f"Error sending to agent: {e}")
 
 @app.post("/nlu/process")
+@limiter.limit("120/minute")
 async def process_text(utterance: Utterance, background_tasks: BackgroundTasks):
     """Process text directly"""
     background_tasks.add_task(process_utterance, utterance)
     return {"status": "processing"}
 
 @app.get("/nlu/meetings/{meeting_id}/results")
+@limiter.limit("60/minute")
 async def get_nlu_results(meeting_id: str):
     """Get NLU results for a meeting"""
     try:

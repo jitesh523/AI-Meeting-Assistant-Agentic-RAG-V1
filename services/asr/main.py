@@ -9,6 +9,9 @@ import numpy as np
 from typing import Dict, List, Optional
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.middleware import SlowAPIMiddleware
 import redis.asyncio as redis
 import asyncpg
 import whisper
@@ -22,6 +25,10 @@ app = FastAPI(title="ASR Service", version="1.0.0")
 
 # CORS middleware
 from .config import settings
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from fastapi import Request, Response
+import time
+import uuid
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,6 +37,42 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+# Prometheus metrics
+REQUEST_COUNT = Counter(
+    "asr_http_requests_total",
+    "Total HTTP requests",
+    ["method", "path", "status"],
+)
+REQUEST_LATENCY = Histogram(
+    "asr_http_request_duration_seconds",
+    "HTTP request latency in seconds",
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5),
+)
+
+
+@app.middleware("http")
+async def add_request_id_and_metrics(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    start = time.perf_counter()
+    response: Response = await call_next(request)
+    elapsed = time.perf_counter() - start
+    route_path = getattr(request.scope.get("route"), "path", request.url.path)
+    REQUEST_COUNT.labels(request.method, route_path, str(response.status_code)).inc()
+    REQUEST_LATENCY.observe(elapsed)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.get("/metrics")
+async def metrics():
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 # Global variables
 redis_client = None
@@ -199,6 +242,7 @@ async def process_audio_stream():
             await asyncio.sleep(1)
 
 @app.post("/asr/process")
+@limiter.limit("60/minute")
 async def process_audio(audio_chunk: AudioChunk, background_tasks: BackgroundTasks):
     """Process audio chunk directly"""
     try:

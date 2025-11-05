@@ -10,3 +10,4 @@ openai==1.51.0
 python-multipart==0.0.9
 pydantic-settings==2.6.1
 prometheus-client==0.20.0
+slowapi==0.1.9
