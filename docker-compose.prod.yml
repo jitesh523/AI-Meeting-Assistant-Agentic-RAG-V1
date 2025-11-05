@@ -19,9 +19,6 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
-    secrets:
-      - database_url
-      - redis_url
     mem_limit: 512m
     cpus: 0.50
 
@@ -117,6 +114,9 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    secrets:
+      - database_url
+      - redis_url
 
   rag:
     build: ./services/rag
@@ -141,6 +141,9 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    secrets:
+      - database_url
+      - redis_url
 
   agent:
     build: ./services/agent
@@ -165,6 +168,9 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    secrets:
+      - database_url
+      - redis_url
 
   integrations:
     build: ./services/integrations
@@ -189,6 +195,9 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    secrets:
+      - database_url
+      - redis_url
 
   ui:
     build: ./services/ui
