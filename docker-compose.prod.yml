@@ -18,6 +18,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 20s
     restart: unless-stopped
     mem_limit: 512m
     cpus: 0.50
@@ -35,6 +36,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   ingestion:
@@ -59,10 +61,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 20s
     restart: unless-stopped
     secrets:
       - database_url
       - redis_url
+    mem_limit: 512m
+    cpus: 0.50
 
   asr:
     build: ./services/asr
@@ -86,10 +91,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
     restart: unless-stopped
     secrets:
       - database_url
       - redis_url
+      - openai_api_key
+    mem_limit: 1g
+    cpus: 1.0
 
   nlu:
     build: ./services/nlu
@@ -113,10 +122,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
     restart: unless-stopped
     secrets:
       - database_url
       - redis_url
+      - openai_api_key
+    mem_limit: 1g
+    cpus: 1.0
 
   rag:
     build: ./services/rag
@@ -140,10 +153,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 40s
     restart: unless-stopped
     secrets:
       - database_url
       - redis_url
+      - openai_api_key
+    mem_limit: 1g
+    cpus: 1.0
 
   agent:
     build: ./services/agent
@@ -167,10 +184,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
     restart: unless-stopped
     secrets:
       - database_url
       - redis_url
+    mem_limit: 1g
+    cpus: 1.0
 
   integrations:
     build: ./services/integrations
@@ -194,10 +214,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
     restart: unless-stopped
     secrets:
       - database_url
       - redis_url
+    mem_limit: 512m
+    cpus: 0.50
 
   ui:
     build: ./services/ui
@@ -220,7 +243,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 20s
     restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.75
 
 volumes:
   postgres_data:
@@ -231,3 +257,5 @@ secrets:
     file: ./secrets/database_url
   redis_url:
     file: ./secrets/redis_url
+  openai_api_key:
+    file: ./secrets/openai_api_key
