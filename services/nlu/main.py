@@ -17,6 +17,7 @@ from pydantic import BaseModel
 import spacy
 from transformers import pipeline
 import openai
+import os
 from .config import settings
 import time
 import uuid
@@ -25,6 +26,35 @@ from fastapi import Request, Response
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+
+# Optional: OpenTelemetry tracing
+if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
+        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
+        from opentelemetry.instrumentation.redis import RedisInstrumentor
+
+        resource = Resource.create({
+            "service.name": "nlu",
+        })
+        provider = TracerProvider(resource=resource)
+        processor = BatchSpanProcessor(OTLPSpanExporter())
+        provider.add_span_processor(processor)
+        trace.set_tracer_provider(provider)
+
+        FastAPIInstrumentor.instrument_app(app)
+        ASGIInstrumentor().instrument()
+        AsyncPGInstrumentor().instrument()
+        RedisInstrumentor().instrument()
+        logger.info("OpenTelemetry tracing enabled for nlu")
+    except Exception as _otel_err:
+        logger.warning(f"Failed to initialize OpenTelemetry: {_otel_err}")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="NLU Service", version="1.0.0")

@@ -18,6 +18,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 import slack_sdk
 from notion_client import Client
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +31,35 @@ from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_
 from fastapi import Request, Response
 import time
 import uuid
+
+# Optional: OpenTelemetry tracing
+if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
+        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
+        from opentelemetry.instrumentation.redis import RedisInstrumentor
+
+        resource = Resource.create({
+            "service.name": "integrations",
+        })
+        provider = TracerProvider(resource=resource)
+        processor = BatchSpanProcessor(OTLPSpanExporter())
+        provider.add_span_processor(processor)
+        trace.set_tracer_provider(provider)
+
+        FastAPIInstrumentor.instrument_app(app)
+        ASGIInstrumentor().instrument()
+        AsyncPGInstrumentor().instrument()
+        RedisInstrumentor().instrument()
+        logger.info("OpenTelemetry tracing enabled for integrations")
+    except Exception as _otel_err:
+        logger.warning(f"Failed to initialize OpenTelemetry: {_otel_err}")
 
 # CORS middleware
 app.add_middleware(
