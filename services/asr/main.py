@@ -56,10 +56,13 @@ app = FastAPI(title="ASR Service", version="1.0.0")
 
 # CORS middleware
 from .config import settings
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from fastapi import Request, Response
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 import time
 import uuid
+import contextvars
 
 app.add_middleware(
     CORSMiddleware,
@@ -74,6 +77,8 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 
+request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+
 # Prometheus metrics
 REQUEST_COUNT = Counter(
     "asr_http_requests_total",
@@ -85,11 +90,36 @@ REQUEST_LATENCY = Histogram(
     "HTTP request latency in seconds",
     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5),
 )
+ERROR_COUNT = Counter(
+    "asr_http_errors_total",
+    "Total HTTP errors",
+    ["type"],
+)
+HEALTH_GAUGE = Gauge(
+    "asr_dependency_up",
+    "Health of dependencies (1 up, 0 down)",
+    ["component"],
+)
+
+
+@app.middleware("http")
+async def size_limit_and_timeout(request: Request, call_next):
+    max_bytes = int(os.getenv("MAX_REQUEST_BYTES", "1048576"))
+    cl = request.headers.get("content-length")
+    if cl and cl.isdigit() and int(cl) > max_bytes:
+        return JSONResponse(status_code=413, content={"error": "Request too large"})
+    timeout_s = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
+    try:
+        return await asyncio.wait_for(call_next(request), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        ERROR_COUNT.labels("timeout").inc()
+        return JSONResponse(status_code=504, content={"error": "Request timed out"})
 
 
 @app.middleware("http")
 async def add_request_id_and_metrics(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    request_id_var.set(request_id)
     start = time.perf_counter()
     response: Response = await call_next(request)
     elapsed = time.perf_counter() - start
@@ -104,6 +134,19 @@ async def add_request_id_and_metrics(request: Request, call_next):
 async def metrics():
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_validation_error(request: Request, exc: RequestValidationError):
+    ERROR_COUNT.labels("validation").inc()
+    return JSONResponse(status_code=422, content={"error": "Validation error", "details": exc.errors(), "request_id": request_id_var.get()})
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(request: Request, exc: Exception):
+    ERROR_COUNT.labels("unhandled").inc()
+    logger.exception(f"Unhandled error: {exc}")
+    return JSONResponse(status_code=500, content={"error": "Internal server error", "request_id": request_id_var.get()})
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -180,15 +223,29 @@ async def startup():
     """Initialize models and connections"""
     global redis_client, db_pool, whisper_model
 
-    # Redis connection
-    redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+    # Redis/DB with retries
+    max_attempts = 5
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+            break
+        except Exception:
+            if attempt == max_attempts:
+                raise
+            await asyncio.sleep(delay)
+            delay *= 2
 
-    # Database connection pool
-    db_pool = await asyncpg.create_pool(
-        settings.database_url,
-        min_size=5,
-        max_size=20,
-    )
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            db_pool = await asyncpg.create_pool(settings.database_url, min_size=5, max_size=20)
+            break
+        except Exception:
+            if attempt == max_attempts:
+                raise
+            await asyncio.sleep(delay)
+            delay *= 2
 
     # Load ASR model based on config
     try:
@@ -385,14 +442,33 @@ async def get_transcript(meeting_id: str):
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with dependency probes"""
+    ok_redis = 0
+    ok_db = 0
+    try:
+        if redis_client:
+            pong = await redis_client.ping()
+            ok_redis = 1 if pong else 0
+    except Exception:
+        ok_redis = 0
+    try:
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchval("SELECT 1")
+                ok_db = 1 if row == 1 else 0
+    except Exception:
+        ok_db = 0
+    HEALTH_GAUGE.labels("redis").set(ok_redis)
+    HEALTH_GAUGE.labels("postgres").set(ok_db)
+    overall = ok_redis and ok_db
     return {
-        "status": "healthy", 
+        "status": "healthy" if overall else "degraded",
         "service": "asr",
         "impl": ("faster" if faster_model else ("openai" if whisper_model else "none")),
         "whisper_available": whisper_model is not None,
         "faster_available": faster_model is not None,
-        "database_available": db_pool is not None
+        "database_available": bool(ok_db),
+        "dependencies": {"redis": bool(ok_redis), "postgres": bool(ok_db)}
     }
 
 # Start background task
