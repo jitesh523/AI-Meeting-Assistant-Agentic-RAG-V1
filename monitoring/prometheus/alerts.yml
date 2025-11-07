@@ -1,0 +1,66 @@
+groups:
+  - name: fastapi-service-alerts
+    interval: 30s
+    rules:
+      - alert: DependencyDown
+        expr: |
+          (agent_dependency_up == 0)
+          or (ingestion_dependency_up == 0)
+          or (asr_dependency_up == 0)
+          or (nlu_dependency_up == 0)
+          or (rag_dependency_up == 0)
+          or (integrations_dependency_up == 0)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service dependency down"
+          description: "One or more dependencies (redis/postgres) are down for at least 5 minutes."
+
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(agent_http_errors_total[5m]))
+            + sum(rate(ingestion_http_errors_total[5m]))
+            + sum(rate(asr_http_errors_total[5m]))
+            + sum(rate(nlu_http_errors_total[5m]))
+            + sum(rate(rag_http_errors_total[5m]))
+            + sum(rate(integrations_http_errors_total[5m]))
+          )
+          /
+          clamp_min(
+            sum(rate(agent_http_requests_total[5m]))
+            + sum(rate(ingestion_http_requests_total[5m]))
+            + sum(rate(asr_http_requests_total[5m]))
+            + sum(rate(nlu_http_requests_total[5m]))
+            + sum(rate(rag_http_requests_total[5m]))
+            + sum(rate(integrations_http_requests_total[5m])),
+            1
+          )
+          > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cluster-wide error rate > 5%"
+          description: "HTTP error rate over total requests exceeded 5% for 10 minutes."
+
+      - alert: HighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(agent_http_request_duration_seconds_bucket[5m])
+              + rate(ingestion_http_request_duration_seconds_bucket[5m])
+              + rate(asr_http_request_duration_seconds_bucket[5m])
+              + rate(nlu_http_request_duration_seconds_bucket[5m])
+              + rate(rag_http_request_duration_seconds_bucket[5m])
+              + rate(integrations_http_request_duration_seconds_bucket[5m])
+            )
+          ) > 1.0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency > 1s"
+          description: "Aggregated p95 HTTP latency across services > 1 second."

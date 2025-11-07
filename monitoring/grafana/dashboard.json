@@ -1,0 +1,68 @@
+{
+  "title": "AI Meeting Assistant - Services",
+  "timezone": "browser",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Dependency Up",
+      "targets": [
+        { "expr": "agent_dependency_up" },
+        { "expr": "ingestion_dependency_up" },
+        { "expr": "asr_dependency_up" },
+        { "expr": "nlu_dependency_up" },
+        { "expr": "rag_dependency_up" },
+        { "expr": "integrations_dependency_up" }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "HTTP Requests (rate)",
+      "targets": [
+        { "expr": "sum(rate(agent_http_requests_total[5m]))" },
+        { "expr": "sum(rate(ingestion_http_requests_total[5m]))" },
+        { "expr": "sum(rate(asr_http_requests_total[5m]))" },
+        { "expr": "sum(rate(nlu_http_requests_total[5m]))" },
+        { "expr": "sum(rate(rag_http_requests_total[5m]))" },
+        { "expr": "sum(rate(integrations_http_requests_total[5m]))" }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "HTTP Errors (rate)",
+      "targets": [
+        { "expr": "sum(rate(agent_http_errors_total[5m]))" },
+        { "expr": "sum(rate(ingestion_http_errors_total[5m]))" },
+        { "expr": "sum(rate(asr_http_errors_total[5m]))" },
+        { "expr": "sum(rate(nlu_http_errors_total[5m]))" },
+        { "expr": "sum(rate(rag_http_errors_total[5m]))" },
+        { "expr": "sum(rate(integrations_http_errors_total[5m]))" }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "HTTP p95 Latency",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(agent_http_request_duration_seconds_bucket[5m])))"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(ingestion_http_request_duration_seconds_bucket[5m])))"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(asr_http_request_duration_seconds_bucket[5m])))"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(nlu_http_request_duration_seconds_bucket[5m])))"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(rag_http_request_duration_seconds_bucket[5m])))"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(integrations_http_request_duration_seconds_bucket[5m])))"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 36,
+  "version": 1
+}

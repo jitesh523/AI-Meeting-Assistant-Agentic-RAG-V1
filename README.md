@@ -220,6 +220,11 @@ cd services/integrations && python -m pytest
 - Centralized log aggregation
 - Error tracking and alerting
 
+### Prometheus and Grafana
+
+- Prometheus alert rules: `monitoring/prometheus/alerts.yml`
+- Grafana dashboard template: `monitoring/grafana/dashboard.json`
+
 ## 🚀 Deployment
 
 ### Production Deployment
@@ -241,6 +246,38 @@ cd services/integrations && python -m pytest
    ```bash
    docker exec -i <postgres-container> psql -U postgres -d meeting_assistant < init.sql
    ```
+
+#### Prod-like compose and infra docs
+
+For a prod-like run with observability enabled and healthchecks tuned:
+
+```
+docker compose -f docker-compose.prod.yml --env-file env.example up --build
+```
+
+See docs/infra.md for details on:
+
+- Secrets and environment variables
+- Health and metrics endpoints per service
+- Request size/time guards, request IDs, and startup retries
+- Optional OpenTelemetry tracing
+
+#### Example compose.override.yml (resource reservations)
+
+If you use Docker Swarm or want to define deploy resource reservations/limits, you can add an override file:
+
+```yaml
+services:
+  nlu:
+    deploy:
+      resources:
+        reservations:
+          cpus: '0.50'
+          memory: 512M
+        limits:
+          cpus: '1.0'
+          memory: 1G
+```
 
 ### Scaling
 
