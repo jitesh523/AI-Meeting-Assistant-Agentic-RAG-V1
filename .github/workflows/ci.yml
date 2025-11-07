@@ -33,3 +33,30 @@ jobs:
             tests/unit/test_agent_metrics.py \
             tests/unit/test_health_ingestion.py \
             tests/unit/test_health_agent.py
+
+  smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start minimal stack (postgres, redis, ingestion, agent)
+        run: |
+          docker compose -f docker-compose.prod.yml --env-file env.example up -d postgres redis ingestion agent
+      - name: Wait for ingestion health
+        run: |
+          for i in {1..30}; do \
+            curl -sf http://localhost:8001/health && break || sleep 2; done
+          curl -sf http://localhost:8001/health | jq .
+      - name: Wait for agent health
+        run: |
+          for i in {1..30}; do \
+            curl -sf http://localhost:8005/health && break || sleep 2; done
+          curl -sf http://localhost:8005/health | jq .
+      - name: Scrape metrics endpoints (ingestion, agent)
+        run: |
+          curl -sf http://localhost:8001/metrics | head -n 20
+          curl -sf http://localhost:8005/metrics | head -n 20
+      - name: Shutdown stack
+        if: always()
+        run: |
+          docker compose -f docker-compose.prod.yml down -v
