@@ -22,6 +22,14 @@ services:
     restart: unless-stopped
     mem_limit: 512m
     cpus: 0.50
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
   redis:
     image: redis:7-alpine
@@ -38,6 +46,14 @@ services:
       retries: 5
       start_period: 10s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
 
   ingestion:
     build: ./services/ingestion
@@ -68,6 +84,14 @@ services:
       - redis_url
     mem_limit: 512m
     cpus: 0.50
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
   asr:
     build: ./services/asr
@@ -96,9 +120,16 @@ services:
     secrets:
       - database_url
       - redis_url
-      - openai_api_key
     mem_limit: 1g
     cpus: 1.0
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.50'
+          memory: 512M
 
   nlu:
     build: ./services/nlu
@@ -130,6 +161,14 @@ services:
       - openai_api_key
     mem_limit: 1g
     cpus: 1.0
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.50'
+          memory: 512M
 
   rag:
     build: ./services/rag
@@ -189,8 +228,17 @@ services:
     secrets:
       - database_url
       - redis_url
+      - openai_api_key
     mem_limit: 1g
     cpus: 1.0
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.50'
+          memory: 512M
 
   integrations:
     build: ./services/integrations
@@ -247,6 +295,14 @@ services:
     restart: unless-stopped
     mem_limit: 512m
     cpus: 0.75
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
 volumes:
   postgres_data:
