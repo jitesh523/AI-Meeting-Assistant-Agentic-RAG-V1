@@ -17,6 +17,30 @@ git clone <repository-url>
 cd AI-Meeting-Assistant-Agentic-RAG-V1-
 ```
 
+### Makefile helper
+
+Common tasks are available via Makefile:
+
+```bash
+make build   # build prod compose images
+make up      # start prod compose
+make down    # stop and remove prod compose
+make logs    # tail logs
+make unit    # run unit tests locally (RUN_UNIT=1)
+make smoke   # run local smoke against /health and /metrics
+make k6      # run a short k6 smoke (requires Docker)
+```
+
+### Load testing (k6)
+
+A tiny smoke script is provided at `scripts/load/k6-smoke.js`.
+
+```bash
+# Ensure services are running locally on default ports
+make up
+make k6
+```
+
 ### 2. Environment Configuration
 
 Create a `.env` file in the root directory:
