@@ -39,9 +39,9 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
-      - name: Start minimal stack (postgres, redis, ingestion, agent)
+      - name: Start minimal stack (postgres, redis, ingestion, agent, nlu, rag)
         run: |
-          docker compose -f docker-compose.prod.yml --env-file env.example up -d postgres redis ingestion agent
+          docker compose -f docker-compose.prod.yml --env-file env.example up -d postgres redis ingestion agent nlu rag
       - name: Wait for ingestion health
         run: |
           for i in {1..30}; do \
@@ -52,10 +52,22 @@ jobs:
           for i in {1..30}; do \
             curl -sf http://localhost:8005/health && break || sleep 2; done
           curl -sf http://localhost:8005/health | jq .
+      - name: Wait for NLU health
+        run: |
+          for i in {1..30}; do \
+            curl -sf http://localhost:8003/health && break || sleep 2; done
+          curl -sf http://localhost:8003/health | jq .
+      - name: Wait for RAG health
+        run: |
+          for i in {1..30}; do \
+            curl -sf http://localhost:8004/health && break || sleep 2; done
+          curl -sf http://localhost:8004/health | jq .
       - name: Scrape metrics endpoints (ingestion, agent)
         run: |
           curl -sf http://localhost:8001/metrics | head -n 20
           curl -sf http://localhost:8005/metrics | head -n 20
+          curl -sf http://localhost:8003/metrics | head -n 20
+          curl -sf http://localhost:8004/metrics | head -n 20
       - name: Shutdown stack
         if: always()
         run: |
