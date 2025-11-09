@@ -50,6 +50,7 @@ logger.addFilter(_RedactFilter())
 app = FastAPI(title="Agent Service", version="1.0.0")
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
+app.state.idem_store = {}
 
 # CORS middleware
 app.add_middleware(
@@ -125,6 +126,25 @@ async def size_limit_and_timeout(request: Request, call_next):
     except asyncio.TimeoutError:
         ERROR_COUNT.labels("timeout").inc()
         return JSONResponse(status_code=504, content={"error": "Request timed out"})
+
+
+@app.middleware("http")
+async def idempotency_guard(request: Request, call_next):
+    # Enforce idempotency for mutating methods when client provides Idempotency-Key
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        key = request.headers.get("Idempotency-Key")
+        if key:
+            now = time.time()
+            ttl = float(os.getenv("IDEMPOTENCY_TTL_SECONDS", "600"))
+            store = app.state.idem_store
+            # purge expired
+            expired = [k for k, v in store.items() if now - v > ttl]
+            for kx in expired:
+                store.pop(kx, None)
+            if key in store:
+                return JSONResponse(status_code=409, content={"error": "Duplicate request", "request_id": request_id_var.get()})
+            store[key] = now
+    return await call_next(request)
 
 
 @app.middleware("http")
