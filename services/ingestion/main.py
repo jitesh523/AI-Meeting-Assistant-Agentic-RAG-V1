@@ -123,6 +123,20 @@ async def size_limit_and_timeout(request: Request, call_next):
 
 
 @app.middleware("http")
+async def api_key_auth(request: Request, call_next):
+    if os.getenv("AUTH_ENABLED", "0") == "1":
+        path = request.url.path
+        if path not in {"/health", "/metrics", "/docs", "/openapi.json"}:
+            hdr = request.headers.get("authorization") or request.headers.get("x-api-key")
+            if hdr and hdr.lower().startswith("bearer "):
+                hdr = hdr.split(" ", 1)[1]
+            expected = os.getenv("SERVICE_API_KEY")
+            if not expected or hdr != expected:
+                return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def add_request_id_and_metrics(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     request_id_var.set(request_id)
