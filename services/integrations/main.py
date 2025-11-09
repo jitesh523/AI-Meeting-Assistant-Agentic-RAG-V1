@@ -19,6 +19,7 @@ from googleapiclient.discovery import build
 import slack_sdk
 from notion_client import Client
 import os
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -78,6 +79,7 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 app.state.idem_store = {}
+app.state.cb_failures = {}
 
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 
@@ -102,6 +104,51 @@ HEALTH_GAUGE = Gauge(
     "Health of dependencies (1 up, 0 down)",
     ["component"],
 )
+
+# External call resilience settings
+CB_WINDOW_SECONDS = float(os.getenv("CB_WINDOW_SECONDS", "60"))
+CB_MAX_FAILURES = int(os.getenv("CB_MAX_FAILURES", "5"))
+RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
+RETRY_BASE = float(os.getenv("RETRY_BASE_SECONDS", "0.5"))
+
+
+def _cb_allow(service: str) -> bool:
+    now = time.perf_counter()
+    bucket = app.state.cb_failures.setdefault(service, [])
+    app.state.cb_failures[service] = [t for t in bucket if (now - t) <= CB_WINDOW_SECONDS]
+    return len(app.state.cb_failures[service]) < CB_MAX_FAILURES
+
+
+def _cb_record(service: str, ok: bool) -> None:
+    if ok:
+        app.state.cb_failures[service] = []
+    else:
+        app.state.cb_failures.setdefault(service, []).append(time.perf_counter())
+
+
+async def _external_call(service: str, fn, *args, **kwargs):
+    if not _cb_allow(service):
+        raise HTTPException(status_code=503, detail=f"{service} temporarily unavailable (circuit open)")
+
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(RETRY_MAX_ATTEMPTS),
+        wait=wait_exponential(multiplier=RETRY_BASE, min=RETRY_BASE, max=5),
+    )
+    async def _run():
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except Exception:
+            ERROR_COUNT.labels("provider").inc()
+            raise
+
+    try:
+        res = await _run()
+        _cb_record(service, True)
+        return res
+    except Exception as e:
+        _cb_record(service, False)
+        raise
 
 
 @app.middleware("http")
@@ -347,10 +394,10 @@ async def draft_gmail_email(data: Dict[str, Any]):
         }
         
         # Create draft
-        draft = service.users().drafts().create(
-            userId='me',
-            body={'message': message}
-        ).execute()
+        draft = await _external_call(
+            "gmail",
+            lambda: service.users().drafts().create(userId='me', body={'message': message}).execute(),
+        )
         
         logger.info(f"Created Gmail draft: {draft['id']}")
         
@@ -367,11 +414,12 @@ async def search_gmail_emails(data: Dict[str, Any]):
         service = build('gmail', 'v1', credentials=credentials)
         
         # Search emails
-        results = service.users().messages().list(
-            userId='me',
-            q=data["query"],
-            maxResults=data.get("max_results", 10)
-        ).execute()
+        results = await _external_call(
+            "gmail",
+            lambda: service.users().messages().list(
+                userId='me', q=data["query"], maxResults=data.get("max_results", 10)
+            ).execute(),
+        )
         
         messages = results.get('messages', [])
         logger.info(f"Found {len(messages)} Gmail messages")
@@ -402,10 +450,11 @@ async def send_slack_message(data: Dict[str, Any]):
         client = slack_sdk.WebClient(token=token)
         
         # Send message
-        response = client.chat_postMessage(
-            channel=data["channel"],
-            text=data["text"],
-            blocks=data.get("blocks")
+        response = await _external_call(
+            "slack",
+            lambda: client.chat_postMessage(
+                channel=data["channel"], text=data["text"], blocks=data.get("blocks")
+            ),
         )
         
         logger.info(f"Sent Slack message: {response['ts']}")
@@ -436,12 +485,15 @@ async def create_notion_page(data: Dict[str, Any]):
         notion = Client(auth=token)
         
         # Create page
-        response = notion.pages.create(
-            parent={"database_id": data["database_id"]},
-            properties={
-                "title": {"title": [{"text": {"content": data["title"]}}]},
-                "content": {"rich_text": [{"text": {"content": data["content"]}}]}
-            }
+        response = await _external_call(
+            "notion",
+            lambda: notion.pages.create(
+                parent={"database_id": data["database_id"]},
+                properties={
+                    "title": {"title": [{"text": {"content": data["title"]}}]},
+                    "content": {"rich_text": [{"text": {"content": data["content"]}}]},
+                },
+            ),
         )
         
         logger.info(f"Created Notion page: {response['id']}")
@@ -480,10 +532,10 @@ async def create_calendar_event(data: Dict[str, Any]):
             'description': data.get("description", "")
         }
         
-        response = service.events().insert(
-            calendarId='primary',
-            body=event
-        ).execute()
+        response = await _external_call(
+            "calendar",
+            lambda: service.events().insert(calendarId='primary', body=event).execute(),
+        )
         
         logger.info(f"Created calendar event: {response['id']}")
         
