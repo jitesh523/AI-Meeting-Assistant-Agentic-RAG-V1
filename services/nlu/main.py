@@ -75,6 +75,7 @@ app.add_middleware(
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
+app.state.idem_store = {}
 
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 
@@ -113,6 +114,23 @@ async def size_limit_and_timeout(request: Request, call_next):
     except asyncio.TimeoutError:
         ERROR_COUNT.labels("timeout").inc()
         return JSONResponse(status_code=504, content={"error": "Request timed out"})
+
+
+@app.middleware("http")
+async def idempotency_guard(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        key = request.headers.get("Idempotency-Key")
+        if key:
+            now = time.perf_counter()
+            ttl = float(os.getenv("IDEMPOTENCY_TTL_SECONDS", "600"))
+            store = app.state.idem_store
+            expired = [k for k, v in store.items() if (now - v) > ttl]
+            for kx in expired:
+                store.pop(kx, None)
+            if key in store:
+                return JSONResponse(status_code=409, content={"error": "Duplicate request"})
+            store[key] = now
+    return await call_next(request)
 
 
 @app.middleware("http")

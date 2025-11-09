@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exceptions import RequestValidationError
 import contextvars
+from tenacity import retry, stop_after_attempts, wait_exponential, retry_if_exception_type, RetryError
 
 # Configure logging with PII redaction
 logging.basicConfig(level=logging.INFO)
@@ -51,6 +52,7 @@ app = FastAPI(title="Agent Service", version="1.0.0")
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 app.state.idem_store = {}
+app.state.cb_failures = []  # (timestamp) rolling window for circuit breaker
 
 # CORS middleware
 app.add_middleware(
@@ -388,20 +390,39 @@ async def summarize_meeting(meeting_id: str):
 
         summary_text = None
         try:
+            # Circuit breaker: if too many failures in window, skip remote call
+            now = time.time()
+            window = float(os.getenv("CB_WINDOW_SECONDS", "60"))
+            max_fail = int(os.getenv("CB_MAX_FAILURES", "5"))
+            app.state.cb_failures = [t for t in app.state.cb_failures if now - t <= window]
+            if len(app.state.cb_failures) >= max_fail:
+                raise RuntimeError("circuit_open")
+
             # Use OpenAI if configured with a real key
             if openai_client and getattr(openai_client, "api_key", "your-api-key-here") != "your-api-key-here":
-                resp = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "Summarize the meeting into Objectives, Key Points, Decisions, and Action Items (with owners). Be concise."},
-                        {"role": "user", "content": transcript or "No transcript"},
-                    ],
-                    max_tokens=300,
-                    temperature=0.3,
-                )
+                @retry(stop=stop_after_attempts(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=4), retry=retry_if_exception_type(Exception))
+                def _call_openai():
+                    return openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "Summarize the meeting into Objectives, Key Points, Decisions, and Action Items (with owners). Be concise."},
+                            {"role": "user", "content": transcript or "No transcript"},
+                        ],
+                        max_tokens=300,
+                        temperature=0.3,
+                    )
+                resp = _call_openai()
                 summary_text = resp.choices[0].message.content.strip()
+        except RetryError as e:
+            logger.warning(f"OpenAI summarization retry exhausted: {e}")
+            app.state.cb_failures.append(time.time())
+            summary_text = None
         except Exception as e:
-            logger.warning(f"OpenAI summarization failed, using heuristic: {e}")
+            if str(e) == "circuit_open":
+                logger.warning("Circuit open for OpenAI summarization; skipping remote call")
+            else:
+                logger.warning(f"OpenAI summarization failed, using heuristic: {e}")
+                app.state.cb_failures.append(time.time())
             summary_text = None
 
         if not summary_text:

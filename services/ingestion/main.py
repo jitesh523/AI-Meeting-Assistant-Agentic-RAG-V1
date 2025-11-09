@@ -137,6 +137,23 @@ async def add_request_id_and_metrics(request: Request, call_next):
 
 
 @app.middleware("http")
+async def idempotency_guard(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        key = request.headers.get("Idempotency-Key")
+        if key:
+            now = time.time()
+            ttl = float(os.getenv("IDEMPOTENCY_TTL_SECONDS", "600"))
+            store = app.state.idem_store
+            expired = [k for k, v in store.items() if now - v > ttl]
+            for kx in expired:
+                store.pop(kx, None)
+            if key in store:
+                return JSONResponse(status_code=409, content={"error": "Duplicate request"})
+            store[key] = now
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response: Response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -192,6 +209,7 @@ class TextUtterance(BaseModel):
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
+app.state.idem_store = {}
 
 @app.on_event("startup")
 async def startup():
