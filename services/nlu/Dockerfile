@@ -1,25 +1,17 @@
-FROM python:3.13-slim
+FROM python:3.13-slim AS base
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 VENV=/opt/venv
+RUN python -m venv $VENV
+ENV PATH="$VENV/bin:$PATH"
 
+FROM base AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential gcc && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    g++ \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements and install Python dependencies
-ENV PIP_DEFAULT_TIMEOUT=180
-RUN pip install --no-cache-dir --upgrade pip
 COPY requirements.txt .
-# Use PyTorch CPU index to avoid GPU wheels and reduce failures
-RUN pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
-# Create non-root user
-RUN useradd -m appuser
-
-# Install spaCy small English model explicitly (compatible with spaCy 3.7.x)
+FROM base AS runtime
+WORKDIR /app
+COPY --from=builder $VENV $VENV
 RUN pip install --no-cache-dir https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
 
 # Copy application code

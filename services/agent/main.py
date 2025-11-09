@@ -261,6 +261,10 @@ async def startup():
             break
         except Exception as e:
             if attempt == max_attempts:
+                if os.getenv("ALLOW_DEGRADED_STARTUP") == "1":
+                    logger.warning("Redis unavailable after retries; starting Agent in degraded mode")
+                    redis_client = None
+                    break
                 raise
             await asyncio.sleep(delay)
             delay *= 2
@@ -271,6 +275,10 @@ async def startup():
             break
         except Exception:
             if attempt == max_attempts:
+                if os.getenv("ALLOW_DEGRADED_STARTUP") == "1":
+                    logger.warning("Postgres unavailable after retries; starting Agent in degraded mode")
+                    db_pool = None
+                    break
                 raise
             await asyncio.sleep(delay)
             delay *= 2
@@ -803,7 +811,8 @@ async def health_check():
 # Start background task
 @app.on_event("startup")
 async def start_background_tasks():
-    asyncio.create_task(process_agent_stream())
+    if redis_client:
+        asyncio.create_task(process_agent_stream())
 
 if __name__ == "__main__":
     import uvicorn

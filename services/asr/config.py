@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List, Optional
 
 
@@ -15,11 +15,7 @@ class Settings(BaseSettings):
     # Compute type for faster-whisper: 'int8', 'int8_float16', 'float16', 'float32'
     asr_compute_type: str = "int8"
 
-    class Config:
-        env_file = "../../.env"
-        env_file_encoding = "utf-8"
-        env_prefix = ""
-        case_sensitive = False
+    model_config = SettingsConfigDict(env_file="../../.env", env_file_encoding="utf-8", case_sensitive=False, secrets_dir="/run/secrets")
 
     @classmethod
     def model_validate_environment(cls) -> "Settings":

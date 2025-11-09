@@ -205,6 +205,10 @@ async def startup():
             break
         except Exception:
             if attempt == max_attempts:
+                if os.getenv("ALLOW_DEGRADED_STARTUP") == "1":
+                    logger.warning("Redis unavailable after retries; starting ingestion in degraded mode")
+                    redis_client = None
+                    break
                 raise
             await asyncio.sleep(delay)
             delay *= 2
@@ -215,6 +219,10 @@ async def startup():
             break
         except Exception:
             if attempt == max_attempts:
+                if os.getenv("ALLOW_DEGRADED_STARTUP") == "1":
+                    logger.warning("Postgres unavailable after retries; starting ingestion in degraded mode")
+                    db_pool = None
+                    break
                 raise
             await asyncio.sleep(delay)
             delay *= 2
