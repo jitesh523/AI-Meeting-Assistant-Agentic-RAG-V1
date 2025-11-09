@@ -5,7 +5,7 @@ from typing import List, Optional
 class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:postgres@postgres:5432/meeting_assistant"
     redis_url: str = "redis://redis:6379"
-    cors_allow_origins: List[str] = ["*"]
+    cors_allow_origins: List[str] = []
     # ASR implementation: 'openai' (default) or 'faster'
     asr_impl: str = "openai"
     # Model size for faster-whisper or openai-whisper (e.g., 'small', 'base')

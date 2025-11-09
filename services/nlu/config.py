@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379"
     openai_api_key: Optional[str] = None
     require_openai: bool = False
-    cors_allow_origins: List[str] = ["*"]
+    cors_allow_origins: List[str] = []
 
     model_config = SettingsConfigDict(env_file="../../.env", env_file_encoding="utf-8", case_sensitive=False, secrets_dir="/run/secrets")
 

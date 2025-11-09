@@ -5,7 +5,7 @@ from typing import List
 class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:postgres@postgres:5432/meeting_assistant"
     redis_url: str = "redis://redis:6379"
-    cors_allow_origins: List[str] = ["*"]
+    cors_allow_origins: List[str] = []
 
     # pydantic-settings v2 preferred config
     model_config = SettingsConfigDict(env_file="../../.env", env_file_encoding="utf-8", case_sensitive=False, secrets_dir="/run/secrets")
