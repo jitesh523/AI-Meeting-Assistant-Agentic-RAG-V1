@@ -39,11 +39,37 @@ Core (set in env.example and consumed via each service's settings):
 - REDIS_URL
 - NEXT_PUBLIC_API_URL (ui)
 - OTEL_EXPORTER_OTLP_ENDPOINT (optional; enables OpenTelemetry)
-- CORS allow list via settings.cors_allow_origins
+- CORS allow list via settings.cors_allow_origins (default deny)
 
 Guards (have safe defaults but can be overridden):
 - MAX_REQUEST_BYTES (default 1048576)
 - REQUEST_TIMEOUT_SECONDS (default 15 for most services, 20 for ASR/RAG)
+
+### Security & Access Control
+- AUTH_ENABLED (0/1): enable API key auth middleware across services
+- SERVICE_API_KEY: shared bearer or X-API-Key value expected by services (per-env)
+- CORS_ALLOW_ORIGINS: comma-separated allow-list (e.g. `https://app.example.com,https://admin.example.com`)
+
+### Idempotency
+- IDEMPOTENCY_TTL_SECONDS (default 600): TTL window for duplicate detection
+- Storage: Redis-backed `SET NX EX` with per-service namespace, falls back to in-memory if Redis unavailable
+
+### Integrations Provider Resilience
+- Circuit breaker window/max failures:
+  - CB_WINDOW_SECONDS (default 60)
+  - CB_MAX_FAILURES (default 5)
+- Retries:
+  - RETRY_MAX_ATTEMPTS (default 3)
+  - RETRY_BASE_SECONDS (default 0.5)
+- Timeouts/budgets:
+  - PROVIDER_TIMEOUT_DEFAULT_SECONDS (default 5) per-attempt timeout
+  - PROVIDER_TOTAL_BUDGET_SECONDS (default 10) overall call budget
+  - TIMEOUT_<PROVIDER>_SECONDS optional per-provider override (e.g., TIMEOUT_SLACK_SECONDS)
+
+Metrics exposed in Integrations:
+- integrations_provider_retries_total{service}
+- integrations_provider_cb_open_total{service}
+- integrations_provider_latency_seconds{service}
 
 ## Health endpoints
 - GET /health on each FastAPI service.

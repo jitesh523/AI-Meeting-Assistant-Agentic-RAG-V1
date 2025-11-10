@@ -232,6 +232,17 @@ cd services/integrations && python -m pytest
 - Audit logging for all actions
 - Data retention policies
 
+### Access Control & Reliability (Ops quick refs)
+- Auth (API key): set `AUTH_ENABLED=1` and `SERVICE_API_KEY=<secret>` per service. Health/metrics/docs are exempt by default.
+- CORS: default deny; allow-list via `CORS_ALLOW_ORIGINS="https://app.example.com,https://admin.example.com"`.
+- Idempotency: Redis-backed keys with TTL (`IDEMPOTENCY_TTL_SECONDS`, default 600) and in-memory fallback.
+- Integrations resilience (retry/circuit):
+  - Circuit: `CB_WINDOW_SECONDS` (60), `CB_MAX_FAILURES` (5)
+  - Retries: `RETRY_MAX_ATTEMPTS` (3), `RETRY_BASE_SECONDS` (0.5)
+  - Timeouts: `PROVIDER_TIMEOUT_DEFAULT_SECONDS` (5), `PROVIDER_TOTAL_BUDGET_SECONDS` (10), overrides: `TIMEOUT_<PROVIDER>_SECONDS`
+
+See `docs/infra.md` for full details.
+
 ## 📈 Monitoring
 
 ### Health Checks
