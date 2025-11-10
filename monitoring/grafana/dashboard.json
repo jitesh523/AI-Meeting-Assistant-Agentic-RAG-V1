@@ -62,6 +62,28 @@
         }
       ]
     }
+    ,
+    {
+      "type": "graph",
+      "title": "Integrations Provider Retries (rate by service)",
+      "targets": [
+        { "expr": "sum by (service) (rate(integrations_provider_retries_total[5m]))" }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Integrations Circuit Opens (rate by service)",
+      "targets": [
+        { "expr": "sum by (service) (rate(integrations_provider_cb_open_total[5m]))" }
+      ]
+    },
+    {
+      "type": "graph",
+      "title": "Integrations Provider p95 Latency",
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le, service) (rate(integrations_provider_latency_seconds_bucket[5m])))" }
+      ]
+    }
   ],
   "schemaVersion": 36,
   "version": 1
