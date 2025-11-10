@@ -134,15 +134,32 @@ async def idempotency_guard(request: Request, call_next):
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         key = request.headers.get("Idempotency-Key")
         if key:
-            now = time.perf_counter()
-            ttl = float(os.getenv("IDEMPOTENCY_TTL_SECONDS", "600"))
-            store = app.state.idem_store
-            expired = [k for k, v in store.items() if (now - v) > ttl]
-            for kx in expired:
-                store.pop(kx, None)
-            if key in store:
-                return JSONResponse(status_code=409, content={"error": "Duplicate request"})
-            store[key] = now
+            ttl = int(float(os.getenv("IDEMPOTENCY_TTL_SECONDS", "600")))
+            rc = globals().get("redis_client")
+            if rc:
+                try:
+                    rkey = f"idemp:rag:{key}"
+                    ok = await rc.set(rkey, "1", ex=ttl, nx=True)
+                    if not ok:
+                        return JSONResponse(status_code=409, content={"error": "Duplicate request"})
+                except Exception:
+                    now = time.perf_counter()
+                    store = app.state.idem_store
+                    expired = [k for k, v in store.items() if (now - v) > ttl]
+                    for kx in expired:
+                        store.pop(kx, None)
+                    if key in store:
+                        return JSONResponse(status_code=409, content={"error": "Duplicate request"})
+                    store[key] = now
+            else:
+                now = time.perf_counter()
+                store = app.state.idem_store
+                expired = [k for k, v in store.items() if (now - v) > ttl]
+                for kx in expired:
+                    store.pop(kx, None)
+                if key in store:
+                    return JSONResponse(status_code=409, content={"error": "Duplicate request"})
+                store[key] = now
     return await call_next(request)
 
 
