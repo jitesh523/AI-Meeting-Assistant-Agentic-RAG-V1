@@ -1,5 +1,8 @@
 # AI Meeting Assistant - Agentic RAG V1
 
+![CI](https://github.com/jitesh523/AI-Meeting-Assistant-Agentic-RAG-V1/actions/workflows/ci.yml/badge.svg)
+![Release SBOM](https://github.com/jitesh523/AI-Meeting-Assistant-Agentic-RAG-V1/actions/workflows/release.yml/badge.svg)
+
 A proactive, Jarvis-like co-pilot for Zoom/Teams/Meet that listens, understands, retrieves context, and takes action with strong privacy controls.
 
 ## 🚀 Quick Start
