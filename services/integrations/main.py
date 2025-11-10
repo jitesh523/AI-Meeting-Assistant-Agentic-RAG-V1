@@ -105,11 +105,31 @@ HEALTH_GAUGE = Gauge(
     ["component"],
 )
 
+# Provider call metrics
+PROVIDER_RETRY_COUNT = Counter(
+    "integrations_provider_retries_total",
+    "Number of provider call retry attempts",
+    ["service"],
+)
+PROVIDER_CB_OPEN_COUNT = Counter(
+    "integrations_provider_cb_open_total",
+    "Times a provider call was short-circuited due to open circuit",
+    ["service"],
+)
+PROVIDER_LATENCY = Histogram(
+    "integrations_provider_latency_seconds",
+    "Latency of outbound provider calls",
+    ["service"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10),
+)
+
 # External call resilience settings
 CB_WINDOW_SECONDS = float(os.getenv("CB_WINDOW_SECONDS", "60"))
 CB_MAX_FAILURES = int(os.getenv("CB_MAX_FAILURES", "5"))
 RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "3"))
 RETRY_BASE = float(os.getenv("RETRY_BASE_SECONDS", "0.5"))
+PROVIDER_TIMEOUT_DEFAULT = float(os.getenv("PROVIDER_TIMEOUT_DEFAULT_SECONDS", "5"))
+PROVIDER_TOTAL_BUDGET = float(os.getenv("PROVIDER_TOTAL_BUDGET_SECONDS", "10"))
 
 
 def _cb_allow(service: str) -> bool:
@@ -128,7 +148,15 @@ def _cb_record(service: str, ok: bool) -> None:
 
 async def _external_call(service: str, fn, *args, **kwargs):
     if not _cb_allow(service):
+        PROVIDER_CB_OPEN_COUNT.labels(service).inc()
         raise HTTPException(status_code=503, detail=f"{service} temporarily unavailable (circuit open)")
+
+    def _timeout_for(svc: str) -> float:
+        env_name = f"TIMEOUT_{svc.upper()}_SECONDS"
+        try:
+            return float(os.getenv(env_name, str(PROVIDER_TIMEOUT_DEFAULT)))
+        except Exception:
+            return PROVIDER_TIMEOUT_DEFAULT
 
     @retry(
         reraise=True,
@@ -137,13 +165,17 @@ async def _external_call(service: str, fn, *args, **kwargs):
     )
     async def _run():
         try:
-            return await asyncio.to_thread(fn, *args, **kwargs)
+            # bound each attempt by per-provider timeout
+            return await asyncio.wait_for(asyncio.to_thread(fn, *args, **kwargs), timeout=_timeout_for(service))
         except Exception:
             ERROR_COUNT.labels("provider").inc()
+            PROVIDER_RETRY_COUNT.labels(service).inc()
             raise
 
     try:
-        res = await _run()
+        start = time.perf_counter()
+        res = await asyncio.wait_for(_run(), timeout=PROVIDER_TOTAL_BUDGET)
+        PROVIDER_LATENCY.labels(service).observe(time.perf_counter() - start)
         _cb_record(service, True)
         return res
     except Exception as e:
