@@ -88,9 +88,14 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare env with auth enabled
+        run: |
+          cp env.example env.ci
+          echo "AUTH_ENABLED=1" >> env.ci
+          echo "SERVICE_API_KEY=ci-smoke-key" >> env.ci
       - name: Start minimal stack (postgres, redis, ingestion, agent, nlu, rag)
         run: |
-          docker compose -f docker-compose.prod.yml --env-file env.example up -d postgres redis ingestion agent nlu rag
+          docker compose -f docker-compose.prod.yml --env-file env.ci up -d postgres redis ingestion agent nlu rag
       - name: Wait for ingestion health
         run: |
           for i in {1..30}; do \
