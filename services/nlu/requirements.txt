@@ -7,7 +7,7 @@ spacy==3.7.2
 transformers==4.35.2
 torch==2.1.0
 openai==1.51.0
-python-multipart==0.0.9
+python-multipart==0.0.18
 pydantic-settings==2.6.1
 prometheus-client==0.20.0
 slowapi==0.1.9
