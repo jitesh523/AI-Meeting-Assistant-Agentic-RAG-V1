@@ -2,31 +2,31 @@
 Agent Service - Agentic orchestrator for tool use and decision making
 """
 import asyncio
+import contextvars
 import json
 import logging
+import os
 import re
-from typing import Dict, List, Optional, Any
-from fastapi import FastAPI, BackgroundTasks
-from fastapi import Body
-from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.middleware import SlowAPIMiddleware
-import redis.asyncio as redis
-import asyncpg
-from pydantic import BaseModel
-import openai
-from .config import settings
 import time
 import uuid
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
-from fastapi import Request, Response
-from starlette.responses import StreamingResponse
-from fastapi.responses import JSONResponse
-from starlette.exceptions import HTTPException as StarletteHTTPException
+from typing import Any, Dict, List, Optional
+
+import asyncpg
+import openai
+import redis.asyncio as redis
+from fastapi import Body, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
-import contextvars
-from tenacity import retry, stop_after_attempts, wait_exponential, retry_if_exception_type, RetryError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+from starlette.responses import StreamingResponse
+from tenacity import RetryError, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from .config import settings
 
 # Configure logging with PII redaction
 logging.basicConfig(level=logging.INFO)
@@ -64,18 +64,18 @@ app.add_middleware(
 )
 
 # Optional: OpenTelemetry tracing
-import os
+
 if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
     try:
         from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
+        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.instrumentation.redis import RedisInstrumentor
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
-        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
-        from opentelemetry.instrumentation.redis import RedisInstrumentor
 
         resource = Resource.create({
             "service.name": "agent",
@@ -311,7 +311,7 @@ async def startup():
         try:
             redis_client = redis.from_url(settings.redis_url, decode_responses=True)
             break
-        except Exception as e:
+        except Exception:
             if attempt == max_attempts:
                 if os.getenv("ALLOW_DEGRADED_STARTUP") == "1":
                     logger.warning("Redis unavailable after retries; starting Agent in degraded mode")
@@ -430,7 +430,7 @@ async def summarize_meeting(meeting_id: str):
 
             # Use OpenAI if configured with a real key
             if openai_client and getattr(openai_client, "api_key", "your-api-key-here") != "your-api-key-here":
-                @retry(stop=stop_after_attempts(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=4), retry=retry_if_exception_type(Exception))
+                @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, min=0.5, max=4), retry=retry_if_exception_type(Exception))
                 def _call_openai():
                     return openai_client.chat.completions.create(
                         model="gpt-4o-mini",
@@ -460,7 +460,7 @@ async def summarize_meeting(meeting_id: str):
             bullets = []
             bullets.append("Objectives: Discuss goals and next steps.")
             if transcript:
-                lines = [l for l in transcript.splitlines() if l.strip()]
+                lines = [line for line in transcript.splitlines() if line.strip()]
                 bullets.append(f"Key Points: {min(len(lines),5)} key exchanges.")
             bullets.append("Decisions: None recorded.")
             bullets.append("Action Items: Capture tasks in follow-up.")

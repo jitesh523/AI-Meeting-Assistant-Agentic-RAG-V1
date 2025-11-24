@@ -3,37 +3,47 @@ ASR Service - OpenAI Whisper for offline audio-to-text processing
 Uses Redis Streams for audio ingestion and publishes NLU events.
 """
 import asyncio
+import contextvars
 import json
 import logging
-import numpy as np
-from typing import Dict, List, Optional
-from fastapi import FastAPI, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.middleware import SlowAPIMiddleware
-import redis.asyncio as redis
-import asyncpg
-import whisper
 import os
+import time
+import uuid
+
+import asyncpg
+import numpy as np
+import redis.asyncio as redis
+import whisper
+from fastapi import BackgroundTasks, FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+
+from .config import settings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+app = FastAPI(title="ASR Service", version="1.0.0")
+
 # Optional: OpenTelemetry tracing
 if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
     try:
         from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
+        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.instrumentation.redis import RedisInstrumentor
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
-        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
-        from opentelemetry.instrumentation.redis import RedisInstrumentor
 
         resource = Resource.create({
             "service.name": "asr",
@@ -51,19 +61,7 @@ if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
     except Exception as _otel_err:
         logger.warning(f"Failed to initialize OpenTelemetry: {_otel_err}")
 
-
-app = FastAPI(title="ASR Service", version="1.0.0")
-
 # CORS middleware
-from .config import settings
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
-from fastapi import Request, Response
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-import time
-import uuid
-import contextvars
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allow_origins,

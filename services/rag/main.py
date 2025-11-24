@@ -2,46 +2,48 @@
 RAG Service - Retrieval-Augmented Generation for context-aware responses
 """
 import asyncio
+import contextvars
 import json
 import logging
-from typing import Dict, List, Optional, Tuple, Any
-from fastapi import FastAPI, BackgroundTasks, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.middleware import SlowAPIMiddleware
-import redis.asyncio as redis
-import asyncpg
-from pydantic import BaseModel
-import numpy as np
-from sentence_transformers import SentenceTransformer
-import openai
 import os
-from .config import settings
-from sklearn.metrics.pairwise import cosine_similarity
 import time
 import uuid
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
-from fastapi import Request, Response
-from fastapi.responses import JSONResponse
+from typing import Any, Dict, List, Optional, Tuple
+
+import asyncpg
+import openai
+import redis.asyncio as redis
+from fastapi import BackgroundTasks, FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
-import contextvars
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
+from slowapi import Limiter
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+
+from .config import settings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="RAG Service", version="1.0.0")
 
 # Optional: OpenTelemetry tracing
 if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
     try:
         from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
+        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.instrumentation.redis import RedisInstrumentor
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
-        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
-        from opentelemetry.instrumentation.redis import RedisInstrumentor
 
         resource = Resource.create({
             "service.name": "rag",
@@ -58,9 +60,6 @@ if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
         logger.info("OpenTelemetry tracing enabled for rag")
     except Exception as _otel_err:
         logger.warning(f"Failed to initialize OpenTelemetry: {_otel_err}")
-logger = logging.getLogger(__name__)
-
-app = FastAPI(title="RAG Service", version="1.0.0")
 
 # CORS middleware
 app.add_middleware(

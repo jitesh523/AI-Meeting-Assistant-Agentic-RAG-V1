@@ -2,24 +2,31 @@
 Integrations Service - Connectors for external services (Gmail, Notion, Slack, etc.)
 """
 import asyncio
+import contextvars
 import json
 import logging
-from typing import Dict, List, Optional, Any
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.middleware import SlowAPIMiddleware
-import redis.asyncio as redis
-import asyncpg
-from pydantic import BaseModel
-import httpx
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-import slack_sdk
-from notion_client import Client
 import os
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+import asyncpg
+import redis.asyncio as redis
+import slack_sdk
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from googleapiclient.discovery import build
+from notion_client import Client
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from .config import settings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,27 +34,18 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Integrations Service", version="1.0.0")
 
-from .config import settings
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
-from fastapi import Request, Response
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-import contextvars
-import time
-import uuid
-
 # Optional: OpenTelemetry tracing
 if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
     try:
         from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
+        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.instrumentation.redis import RedisInstrumentor
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
-        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
-        from opentelemetry.instrumentation.redis import RedisInstrumentor
 
         resource = Resource.create({
             "service.name": "integrations",
@@ -178,7 +176,7 @@ async def _external_call(service: str, fn, *args, **kwargs):
         PROVIDER_LATENCY.labels(service).observe(time.perf_counter() - start)
         _cb_record(service, True)
         return res
-    except Exception as e:
+    except Exception:
         _cb_record(service, False)
         raise
 
@@ -514,6 +512,28 @@ async def send_slack_message(data: Dict[str, Any]):
     except Exception as e:
         logger.error(f"Error sending Slack message: {e}")
 
+async def create_slack_channel(data: Dict[str, Any]):
+    """Create a Slack channel"""
+    try:
+        # Get user credentials
+        token = await get_user_credentials(data["user_id"], "slack")
+        
+        # Create Slack client
+        client = slack_sdk.WebClient(token=token)
+        
+        # Create channel
+        response = await _external_call(
+            "slack",
+            lambda: client.conversations_create(
+                name=data["name"], is_private=data.get("is_private", False)
+            ),
+        )
+        
+        logger.info(f"Created Slack channel: {response['channel']['id']}")
+        
+    except Exception as e:
+        logger.error(f"Error creating Slack channel: {e}")
+
 # Notion Integration
 async def handle_notion_action(action: str, data: Dict[str, Any]):
     """Handle Notion actions"""
@@ -552,6 +572,28 @@ async def create_notion_page(data: Dict[str, Any]):
         
     except Exception as e:
         logger.error(f"Error creating Notion page: {e}")
+
+async def search_notion_pages(data: Dict[str, Any]):
+    """Search pages in Notion"""
+    try:
+        # Get user credentials
+        token = await get_user_credentials(data["user_id"], "notion")
+        
+        # Create Notion client
+        notion = Client(auth=token)
+        
+        # Search pages
+        response = await _external_call(
+            "notion",
+            lambda: notion.search(
+                query=data.get("query", ""), filter={"property": "object", "value": "page"}
+            ),
+        )
+        
+        logger.info(f"Found {len(response.get('results', []))} Notion pages")
+        
+    except Exception as e:
+        logger.error(f"Error searching Notion pages: {e}")
 
 # Calendar Integration
 async def handle_calendar_action(action: str, data: Dict[str, Any]):
@@ -593,6 +635,32 @@ async def create_calendar_event(data: Dict[str, Any]):
         
     except Exception as e:
         logger.error(f"Error creating calendar event: {e}")
+
+async def list_calendar_events(data: Dict[str, Any]):
+    """List calendar events"""
+    try:
+        # Get user credentials
+        credentials = await get_user_credentials(data["user_id"], "calendar")
+        
+        # Build Calendar service
+        service = build('calendar', 'v3', credentials=credentials)
+        
+        # List events
+        response = await _external_call(
+            "calendar",
+            lambda: service.events().list(
+                calendarId='primary',
+                maxResults=data.get("max_results", 10),
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute(),
+        )
+        
+        events = response.get('items', [])
+        logger.info(f"Found {len(events)} calendar events")
+        
+    except Exception as e:
+        logger.error(f"Error listing calendar events: {e}")
 
 # Helper functions
 async def get_user_credentials(user_id: str, service: str) -> Dict[str, Any]:

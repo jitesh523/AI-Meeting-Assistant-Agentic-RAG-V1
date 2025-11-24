@@ -2,46 +2,50 @@
 NLU Service - Intent detection, entity extraction, and sentiment analysis
 """
 import asyncio
+import contextvars
 import json
 import logging
-import re
-from typing import Dict, List, Optional, Tuple
-from fastapi import FastAPI, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.middleware import SlowAPIMiddleware
-import redis.asyncio as redis
-import asyncpg
-from pydantic import BaseModel
-import spacy
-from transformers import pipeline
-import openai
 import os
-from .config import settings
+import re
 import time
 import uuid
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
-from fastapi import Request, Response
-from fastapi.responses import JSONResponse
+from typing import Dict, List
+
+import asyncpg
+import openai
+import redis.asyncio as redis
+import spacy
+from fastapi import BackgroundTasks, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
-import contextvars
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+from transformers import pipeline
+
+from .config import settings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="NLU Service", version="1.0.0")
 
 # Optional: OpenTelemetry tracing
 if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
     try:
         from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
+        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.instrumentation.redis import RedisInstrumentor
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
-        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
-        from opentelemetry.instrumentation.redis import RedisInstrumentor
 
         resource = Resource.create({
             "service.name": "nlu",
@@ -58,9 +62,6 @@ if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
         logger.info("OpenTelemetry tracing enabled for nlu")
     except Exception as _otel_err:
         logger.warning(f"Failed to initialize OpenTelemetry: {_otel_err}")
-logger = logging.getLogger(__name__)
-
-app = FastAPI(title="NLU Service", version="1.0.0")
 
 # CORS middleware
 app.add_middleware(

@@ -2,20 +2,28 @@
 Ingestion Service - WebSocket audio ingestion and real-time processing
 """
 import asyncio
+import contextvars
 import json
 import logging
-import re
-from typing import Dict, Any
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi import Body
-from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.middleware import SlowAPIMiddleware
-import redis.asyncio as redis
-import asyncpg
-from pydantic import BaseModel
 import os
+import re
+import time
+import uuid
+from typing import Dict
+
+import asyncpg
+import redis.asyncio as redis
+from fastapi import Body, FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+
+from .config import settings
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -34,16 +42,6 @@ logger.addFilter(_RedactFilter())
 
 app = FastAPI(title="Ingestion Service", version="1.0.0")
 
-# Config and observability
-from .config import settings
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
-from fastapi import Request, Response
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-import contextvars
-import time
-import uuid
-
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -57,14 +55,14 @@ app.add_middleware(
 if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
     try:
         from opentelemetry import trace
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
+        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        from opentelemetry.instrumentation.redis import RedisInstrumentor
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-        from opentelemetry.instrumentation.asgi import ASGIInstrumentor
-        from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
-        from opentelemetry.instrumentation.redis import RedisInstrumentor
 
         resource = Resource.create({
             "service.name": "ingestion",
