@@ -11,9 +11,9 @@ python-multipart==0.0.18
 pydantic-settings==2.6.1
 prometheus-client==0.20.0
 slowapi==0.1.9
-opentelemetry-sdk
-opentelemetry-exporter-otlp
-opentelemetry-instrumentation-fastapi
-opentelemetry-instrumentation-asgi
-opentelemetry-instrumentation-redis
-opentelemetry-instrumentation-asyncpg
+# opentelemetry-sdk
+# opentelemetry-exporter-otlp
+# opentelemetry-instrumentation-fastapi
+# opentelemetry-instrumentation-asgi
+# opentelemetry-instrumentation-redis
+# opentelemetry-instrumentation-asyncpg
