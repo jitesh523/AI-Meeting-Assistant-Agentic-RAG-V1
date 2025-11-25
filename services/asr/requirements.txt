@@ -10,9 +10,9 @@ pydantic-settings==2.6.1
 faster-whisper==1.0.3
 slowapi==0.1.9
 prometheus-client==0.20.0
-opentelemetry-sdk==1.25.0
-opentelemetry-exporter-otlp==1.25.0
-opentelemetry-instrumentation-fastapi==0.46b0
-opentelemetry-instrumentation-asgi==0.46b0
-opentelemetry-instrumentation-redis==0.46b0
-opentelemetry-instrumentation-asyncpg==0.46b0
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-asgi
+opentelemetry-instrumentation-redis
+opentelemetry-instrumentation-asyncpg
