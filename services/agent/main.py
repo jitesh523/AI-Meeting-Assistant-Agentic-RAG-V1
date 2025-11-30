@@ -748,17 +748,21 @@ async def execute_action(action: Action):
         action.status = "executing"
         await update_action_status(action)
         
+        result = {}
+        
         # Execute based on tool type
         if action.tool == "search_docs":
             result = await search_documents(action.input_data)
         elif action.tool == "compose_email":
-            result = await compose_email(action.input_data)
+            result = await publish_integration_task("gmail", "draft_email", action.input_data, action.approved_by)
         elif action.tool == "create_ticket":
-            result = await create_ticket(action.input_data)
+            # Assuming 'create_ticket' maps to Notion for now, or we could add a 'service' field to payload
+            result = await publish_integration_task("notion", "create_page", action.input_data, action.approved_by)
         elif action.tool == "schedule_event":
-            result = await schedule_event(action.input_data)
+            result = await publish_integration_task("calendar", "create_event", action.input_data, action.approved_by)
         elif action.tool == "log_crm_note":
-            result = await log_crm_note(action.input_data)
+            # Mapping CRM note to Notion for now
+            result = await publish_integration_task("notion", "create_page", action.input_data, action.approved_by)
         elif action.tool == "summarize":
             result = await create_summary(action.input_data)
         else:
@@ -776,6 +780,28 @@ async def execute_action(action: Action):
         action.status = "failed"
         action.error_message = str(e)
         await update_action_status(action)
+
+async def publish_integration_task(service: str, action: str, data: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
+    """Publish task to integrations service via Redis"""
+    try:
+        if not redis_client:
+            return {"error": "Redis client not available"}
+            
+        task_data = {
+            "service": service,
+            "action": action,
+            "data": {
+                **data,
+                "user_id": user_id or "default_user"  # Fallback if no approver
+            }
+        }
+        
+        await redis_client.publish("integration_task", json.dumps(task_data))
+        return {"status": "queued", "service": service, "action": action}
+        
+    except Exception as e:
+        logger.error(f"Error publishing integration task: {e}")
+        return {"error": str(e)}
 
 async def update_action_status(action: Action):
     """Update action status in database"""
@@ -797,25 +823,11 @@ async def search_documents(input_data: Dict[str, Any]) -> Dict[str, Any]:
     # TODO: Implement document search
     return {"status": "success", "results": []}
 
-async def compose_email(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Compose an email"""
-    # TODO: Implement email composition
-    return {"status": "success", "draft_id": "draft_123"}
-
-async def create_ticket(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Create a ticket"""
-    # TODO: Implement ticket creation
-    return {"status": "success", "ticket_id": "ticket_123"}
-
-async def schedule_event(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Schedule an event"""
-    # TODO: Implement event scheduling
-    return {"status": "success", "event_id": "event_123"}
-
-async def log_crm_note(input_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Log a CRM note"""
-    # TODO: Implement CRM logging
-    return {"status": "success", "note_id": "note_123"}
+# Stubs removed, replaced by publish_integration_task
+# async def compose_email...
+# async def create_ticket...
+# async def schedule_event...
+# async def log_crm_note...
 
 async def create_summary(input_data: Dict[str, Any]) -> Dict[str, Any]:
     """Create a summary"""
