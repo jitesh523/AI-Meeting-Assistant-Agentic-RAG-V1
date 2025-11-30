@@ -205,20 +205,20 @@ cd services/integrations && python -m pytest
 ## 📊 Features
 
 ### Current (MVP)
-- ✅ Real-time audio transcription
+- ✅ Real-time audio transcription (WebSocket Stream)
 - ✅ Speaker diarization
 - ✅ Intent detection and entity extraction
 - ✅ Basic RAG for context retrieval
 - ✅ AI suggestion generation
 - ✅ Web-based companion interface
 - ✅ Privacy mode controls
+- ✅ Post-meeting summaries (Enterprise)
 
 ### Planned (V1)
 - 🔄 Gmail/Outlook integration
 - 🔄 Slack integration
 - 🔄 Notion integration
 - 🔄 Calendar integration
-- 🔄 Post-meeting summaries
 - 🔄 Action item tracking
 - 🔄 Advanced privacy controls
 
